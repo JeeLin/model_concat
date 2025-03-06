@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-hans">
+<head>
+    <title>音频对话测试页</title>
+</head>
+<body>
+    <!-- 文本交互区 -->
+    <h3>文本交互</h3>
+    <input type="text" id="message" placeholder="输入文本消息">
+    <button onclick="sendText()">发送文本</button>
+
+    <!-- 音频交互区 -->
+    <h3>音频交互</h3>
+    <button id="recordBtn" onclick="toggleRecording()">开始录音</button>
+    <audio id="audioPlayback" controls></audio>
+
+    <!-- 消息显示区 -->
+    <div id="output" style="margin-top:20px;"></div>
+
+<script>
+    const ws = new WebSocket('ws://localhost:8080/');
+    let mediaRecorder;
+    let audioChunks = [];
+
+    // 初始化音频录制
+    navigator.mediaDevices.getUserMedia({audio: true})
+        .then(stream => {
+            mediaRecorder = new MediaRecorder(stream);
+
+            mediaRecorder.ondataavailable = (e) => {
+                audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                const audioBlob = new Blob(audioChunks, {type: 'audio/wav'});
+                sendAudio(audioBlob);
+                audioChunks = [];
+            };
+        })
+        .catch(err => log('麦克风访问错误: ' + err));
+
+    // 音频控制
+    function toggleRecording() {
+        if (mediaRecorder.state === 'inactive') {
+            mediaRecorder.start();
+            recordBtn.textContent = '停止录音';
+            log('录音中...');
+        } else {
+            mediaRecorder.stop();
+            recordBtn.textContent = '开始录音';
+        }
+    }
+
+    // 发送音频数据
+    function sendAudio(audioBlob) {
+        const reader = new FileReader();
+        reader.onload = () => {
+            ws.send(reader.result); // 发送二进制数据
+            log('已发送音频片段');
+        };
+        reader.readAsArrayBuffer(audioBlob);
+    }
+
+    // 发送文本消息
+    function sendText() {
+        const msg = document.getElementById('message').value;
+        ws.send(JSON.stringify({type: 'text', msg}));
+        log('已发送文本: ' + msg);
+    }
+
+    // 处理服务器响应
+    ws.onmessage = (e) => {
+        if (e.data instanceof Blob) {
+            // 处理音频响应
+            const audioURL = URL.createObjectURL(e.data);
+            audioPlayback.src = audioURL;
+            log('收到音频响应');
+        } else {
+            // 处理文本响应
+            log('服务器回复: ' + e.data);
+        }
+    };
+
+    // 错误处理
+    ws.onerror = (e) => {
+        log('连接错误: ' + e.data);
+    };
+
+    // 日志输出函数
+    function log(text) {
+        document.getElementById('output').innerHTML += text + '<br>';
+    }
+</script>
+</body>
+</html>

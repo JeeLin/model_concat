@@ -1,0 +1,33 @@
+[server]
+http_port = 8080
+ws_port = 8081
+host = "127.0.0.1"
+workers = 4
+
+# 按处理阶段组织模型
+[[stages]]
+name = "text_processing"
+[[stages.models]]
+name = "text-model-1"
+url = "http://localhost:5000"
+timeout = 30
+retry_count = 3
+
+[[stages.models]]
+name = "text-model-2"
+url = "http://localhost:5001"
+timeout = 30
+retry_count = 3
+
+[[stages]]
+name = "audio_processing"
+[[stages.models]]
+name = "audio-model-1"
+url = "http://localhost:5002"
+timeout = 60
+retry_count = 2
+
+[audio]
+supported_formats = ["wav", "mp3", "ogg"]
+max_file_size = 10485760  # 10MB
+default_sample_rate = 16000 

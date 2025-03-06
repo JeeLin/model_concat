@@ -1,0 +1,49 @@
+// 客户端发送
+{
+    "type": "Start",
+    "data": {
+        "pipeline": {
+            "name": "realtime_translation",
+            "stages": [
+                {
+                    "name": "speech_to_text",
+                    "models": [
+                        {
+                            "provider": "openai",
+                            "model_id": "whisper"
+                        }
+                    ]
+                },
+                {
+                    "name": "translation",
+                    "models": [
+                        {
+                            "provider": "openai",
+                            "model_id": "gpt-4"
+                        }
+                    ]
+                }
+            ]
+        },
+        "input": {
+            "type": "audio",
+            "data": {
+                "content": "streaming_audio_data",
+                "format": {
+                    "codec": "wav",
+                    "sample_rate": 16000,
+                    "channels": 1
+                }
+            }
+        }
+    }
+}
+// 服务器响应
+{
+    "type": "Progress",
+    "data": {
+        "stage": "speech_to_text",
+        "progress": 45,
+        "intermediate_result": "正在识别语音..."
+    }
+}

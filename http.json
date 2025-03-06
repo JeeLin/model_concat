@@ -1,0 +1,33 @@
+POST /api/v1/tasks
+{
+    "task_id": "task-123",
+    "pipeline": {
+        "name": "speech_analysis",
+        "stages": [
+            {
+                "name": "speech_to_text",
+                "models": [
+                    {
+                        "provider": "openai",
+                        "model_id": "whisper",
+                        "parameters": {
+                            "language": "zh"
+                        }
+                    }
+                ]
+            }
+        ]
+    },
+    "input": {
+        "type": "audio",
+        "data": {
+            "content": "base64_audio_data",
+            "format": {
+                "codec": "mp3",
+                "sample_rate": 16000,
+                "channels": 1
+            }
+        }
+    },
+    "callback_url": "http://example.com/callback"
+}
