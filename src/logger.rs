@@ -5,8 +5,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// 日志管理器
-pub struct Logger {
-}
+pub struct Logger {}
 
 impl Logger {
     pub fn init() -> ServiceResult<Self> {

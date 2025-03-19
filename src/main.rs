@@ -20,6 +20,7 @@
 use tokio;
 
 use crate::config::Config;
+use crate::error::ServiceResult;
 use crate::logger::Logger;
 use crate::server::start_server;
 
@@ -31,9 +32,10 @@ pub mod metrics;
 pub mod model;
 pub mod orchestration;
 pub mod server;
+pub mod text;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ServiceResult<()> {
     // 初始化日志系统
     let _logger = Logger::init()?;
     log_info!("Starting Model Concat Service...");
@@ -51,5 +53,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_addr = format!("{}:{}", config.server.host, config.server.port);
     log_info!("Server starting on {}", &http_addr);
     // 启动HTTP服务器
-    start_server(&http_addr).await
+    start_server(&config).await
 }

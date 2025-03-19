@@ -4,15 +4,17 @@
 //!
 //! - 处理流水线（Pipeline）：组织和执行多个模型，支持串行和并行执行模式，管理模型间的数据流转和格式转换
 //! - 流水线工厂（Factory）：创建和缓存处理流水线实例，优化资源利用
-//! - 协议处理器（ProtocolHandler）：统一不同通信协议的处理接口，支持HTTP和WebSocket
+//! - 数据格式（DataFormat）：统一不同类型数据的表示和处理
+//! - 格式转换器（FormatConverter）：提供不同数据格式之间的转换能力
 //!
 //! # 示例
 //!
 //! ```rust
-//! use crate::orchestration::{PipelineFactory, PipelineRequest, ExecutionMode};
+//! use crate::orchestration::{PipelineFactory, PipelineRequest, ExecutionMode, MergeStrategy};
+//! use crate::model::ModelParams;
 //!
 //! // 创建流水线工厂
-//! let factory = PipelineFactory::new(model_factory, audio_converter, metrics);
+//! let factory = PipelineFactory::new(model_factory, audio_converter, text_converter, metrics_manager);
 //!
 //! // 构建处理请求
 //! let request = PipelineRequest {
@@ -24,23 +26,26 @@
 //!             parameters: ModelParams::default(),
 //!             execution_mode: ExecutionMode::Sequential,
 //!         },
-//!         // ...
+//!         ModelRequest {
+//!             provider: "gpt".to_string(),
+//!             model_id: "gpt-4".to_string(),
+//!             parameters: ModelParams::default(),
+//!             execution_mode: ExecutionMode::Sequential,
+//!         },
 //!     ],
-//!     // ...
+//!     merge_strategy: Some(MergeStrategy::First),
 //! };
 //!
 //! // 创建并执行流水线
 //! let pipeline = factory.create_pipeline(&request).await?;
-//! let result = pipeline.execute(input).await?;
+//! let (result, format) = pipeline.execute(input, input_format).await?;
 //! ```
 
 // 导入模块
 mod factory;
 mod pipeline;
-mod pipeline_group;
-mod pipeline_with_groups;
-mod protocol_handler;
+mod types;
 
-// 导出新版API
-pub use factory::{PipelineFactory, PipelineRequest};
-pub use protocol_handler::ProtocolHandler;
+// 导出公共接口
+pub use factory::{ModelRequest, PipelineFactory, PipelineRequest};
+pub use types::FormatConverter;

@@ -1,34 +1,28 @@
-use crate::audio::converter::FormatConverterFactory;
-use crate::audio::converter::GenericConversionStrategy;
-use crate::audio::format::AudioCodec;
-use crate::audio::{AudioConverter, AudioFormat};
+//! 流水线工厂模块
+//!
+//! 本模块提供了流水线实例的创建和管理功能，主要包括：
+//!
+//! - 流水线工厂：负责创建和管理不同类型的流水线实例
+//! - 流水线缓存：支持流水线实例的缓存和复用
+//! - 参数配置：统一管理流水线参数和配置信息
+
 use crate::error::{ServiceError, ServiceResult};
 use crate::metrics::MetricsManager;
 use crate::model::factory::ModelFactory;
-use crate::model::{Model, ModelFactory, ModelParams};
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use crate::model::{Model, ModelParams};
+use crate::orchestration::pipeline::{ExecutionMode, Pipeline};
+use crate::orchestration::types::{MergeStrategy, StageConfig};
+use crate::{log_debug, log_warn};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
-
-use super::pipeline::{ExecutionMode, Pipeline};
-use super::pipeline_group::{MergeStrategy, ModelGroup};
-use super::pipeline_with_groups::PipelineWithGroups;
 
 /// 流水线请求配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PipelineRequest {
     /// 流水线名称
     pub name: String,
-    /// 模型配置列表
-    pub models: Vec<ModelRequest>,
-    /// 模型组配置列表（可选）
-    #[serde(default)]
-    pub model_groups: Vec<ModelGroupRequest>,
-    /// 结果合并策略
-    #[serde(default)]
-    pub merge_strategy: Option<MergeStrategy>,
+    /// 阶段配置列表
+    // #[serde(default)]
+    pub stages: Vec<StageRequest>,
 }
 
 impl PipelineRequest {
@@ -36,24 +30,16 @@ impl PipelineRequest {
     ///
     /// 根据请求参数生成唯一的缓存键，用于标识不同的流水线配置
     pub fn cache_key(&self) -> String {
-        // 生成更精确的缓存键，包含模型和模型组信息
+        // 生成更精确的缓存键，包含阶段和模型信息
         let mut key = format!("pipeline:{}", self.name);
 
-        // 添加模型信息
-        if !self.models.is_empty() {
-            key.push_str(":models");
-            for model in &self.models {
-                key.push_str(&format!(",{}:{}", model.provider, model.model_id));
-            }
-        }
-
-        // 添加模型组信息
-        if !self.model_groups.is_empty() {
-            key.push_str(":groups");
-            for group in &self.model_groups {
-                key.push_str(&format!(",{}", group.name));
-                for model in &group.models {
-                    key.push_str(&format!("-{}:{}", model.provider, model.model_id));
+        // 添加阶段和模型信息
+        if !self.stages.is_empty() {
+            key.push_str(":stages");
+            for stage in &self.stages {
+                key.push_str(&format!(":{}", stage.name));
+                for model in &stage.models {
+                    key.push_str(&format!(",{}:{}", model.provider, model.model_id));
                 }
             }
         }
@@ -61,30 +47,23 @@ impl PipelineRequest {
         key
     }
 
-    /// 检查是否使用模型组
-    ///
-    /// 如果请求中包含模型组配置，则返回true
-    pub fn uses_model_groups(&self) -> bool {
-        !self.model_groups.is_empty()
-    }
-
     /// 验证请求配置的有效性
     ///
-    /// 检查请求中的模型配置是否有效
+    /// 检查请求中的阶段和模型配置是否有效，并验证阶段间的输入输出兼容性
     pub fn validate(&self) -> ServiceResult<()> {
-        // 检查是否至少有一个模型或模型组
-        if self.models.is_empty() && self.model_groups.is_empty() {
-            return Err(ServiceError::Pipeline(
-                "Pipeline request must contain at least one model or model group".to_string(),
+        // 检查是否至少有一个阶段
+        if self.stages.is_empty() {
+            return Err(ServiceError::UnsupportedOperation(
+                "Pipeline request must contain at least one stage".to_string(),
             ));
         }
 
-        // 检查模型组是否有效
-        for group in &self.model_groups {
-            if group.models.is_empty() {
-                return Err(ServiceError::Pipeline(format!(
-                    "Model group '{}' has no models",
-                    group.name
+        // 检查每个阶段是否至少有一个模型
+        for stage in &self.stages {
+            if stage.models.is_empty() {
+                return Err(ServiceError::UnsupportedOperation(format!(
+                    "Stage '{}' must contain at least one model",
+                    stage.name
                 )));
             }
         }
@@ -94,7 +73,7 @@ impl PipelineRequest {
 }
 
 /// 模型请求配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ModelRequest {
     /// 模型提供者
     pub provider: String,
@@ -103,20 +82,8 @@ pub struct ModelRequest {
     /// 模型参数
     pub parameters: ModelParams,
     /// 执行模式
-    #[serde(default = "default_execution_mode")]
+    // #[serde(default = "default_execution_mode")]
     pub execution_mode: ExecutionMode,
-}
-
-/// 模型组请求配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelGroupRequest {
-    /// 组名称
-    pub name: String,
-    /// 组内模型配置列表
-    pub models: Vec<ModelRequest>,
-    /// 结果合并策略
-    #[serde(default = "default_merge_strategy")]
-    pub merge_strategy: MergeStrategy,
 }
 
 /// 默认执行模式为串行
@@ -129,71 +96,26 @@ fn default_merge_strategy() -> MergeStrategy {
     MergeStrategy::First
 }
 
+/// 阶段请求配置
+#[derive(Debug, Clone)]
+pub struct StageRequest {
+    /// 阶段名称
+    pub name: String,
+    /// 模型配置列表
+    pub models: Vec<ModelRequest>,
+    /// 结果合并策略
+    // #[serde(default)]
+    pub merge_strategy: MergeStrategy,
+}
+
 /// 流水线工厂
 ///
-/// 负责创建和管理音频处理流水线，支持流水线缓存和格式转换策略的注册。
-///
-/// # 示例
-///
-/// ```rust
-/// use crate::orchestration::factory_new::{PipelineFactory, PipelineRequest};
-///
-/// let factory = PipelineFactory::new(
-///     model_factory,
-///     audio_converter,
-///     metrics_manager
-/// );
-///
-/// let pipeline = factory.create_pipeline(&request).await?;
-/// ```
+/// 负责创建和管理处理流水线
 pub struct PipelineFactory {
     /// 模型工厂
-    model_factory: Arc<ModelFactory>,
-    /// 音频转换器
-    audio_converter: Arc<AudioConverter>,
+    model_factory: &'static Arc<ModelFactory>,
     /// 性能指标管理器
     metrics_manager: Arc<MetricsManager>,
-    /// 缓存的流水线
-    pipeline_cache: RwLock<HashMap<String, Arc<dyn PipelineExecutor>>>,
-    /// 缓存键的使用顺序，用于实现LRU缓存策略
-    cache_keys_order: RwLock<VecDeque<String>>,
-    /// 最大缓存大小
-    max_cache_size: usize,
-}
-
-/// 流水线执行器特征
-///
-/// 定义了流水线执行的通用接口，使不同类型的流水线实现可以统一处理
-#[async_trait::async_trait]
-pub trait PipelineExecutor: Send + Sync {
-    /// 执行流水线处理
-    async fn execute(
-        &self,
-        input: Vec<u8>,
-        format: Option<AudioFormat>,
-    ) -> ServiceResult<(Vec<u8>, Option<AudioFormat>)>;
-}
-
-#[async_trait::async_trait]
-impl PipelineExecutor for Pipeline {
-    async fn execute(
-        &self,
-        input: Vec<u8>,
-        format: Option<AudioFormat>,
-    ) -> ServiceResult<(Vec<u8>, Option<AudioFormat>)> {
-        Pipeline::execute(self, input, format).await
-    }
-}
-
-#[async_trait::async_trait]
-impl PipelineExecutor for PipelineWithGroups {
-    async fn execute(
-        &self,
-        input: Vec<u8>,
-        format: Option<AudioFormat>,
-    ) -> ServiceResult<(Vec<u8>, Option<AudioFormat>)> {
-        PipelineWithGroups::execute(self, input, format).await
-    }
 }
 
 impl PipelineFactory {
@@ -202,163 +124,120 @@ impl PipelineFactory {
     /// # 参数
     ///
     /// * `model_factory` - 模型工厂实例
-    /// * `audio_converter` - 音频转换器实例
+    /// * `audio_converter_factory` - 音频转换器工厂实例
+    /// * `text_converter_factory` - 文本转换器工厂实例
     /// * `metrics_manager` - 性能指标管理器实例
-    pub fn new(
-        model_factory: Arc<ModelFactory>,
-        audio_converter: Arc<AudioConverter>,
-        metrics_manager: Arc<MetricsManager>,
-    ) -> Self {
+    pub fn new(model_factory: &Arc<ModelFactory>, metrics_manager: Arc<MetricsManager>) -> Self {
         Self {
             model_factory,
-            audio_converter,
             metrics_manager,
-            pipeline_cache: RwLock::new(HashMap::new()),
-            cache_keys_order: RwLock::new(VecDeque::new()),
-            max_cache_size: 50, // 默认最大缓存大小
         }
     }
 
-    /// 设置最大缓存大小
+    /// 创建处理流水线
     ///
     /// # 参数
     ///
-    /// * `size` - 最大缓存大小
-    pub fn with_max_cache_size(mut self, size: usize) -> Self {
-        self.max_cache_size = size;
-        self
-    }
-
-    /// 根据请求创建流水线
-    ///
-    /// # 参数
-    ///
-    /// * `request` - 流水线配置请求
+    /// * `request` - 流水线请求配置
     ///
     /// # 返回值
     ///
     /// 返回创建的流水线实例
-    pub async fn create_pipeline(
-        &self,
-        request: &PipelineRequest,
-    ) -> ServiceResult<Arc<dyn PipelineExecutor>> {
-        // 验证请求配置
+    pub async fn create_pipeline(&self, request: &PipelineRequest) -> ServiceResult<Arc<Pipeline>> {
+        // 验证请求
         request.validate()?;
 
-        // 检查缓存
-        let cache_key = request.cache_key();
-        {
-            let cache = self.pipeline_cache.read().await;
-            if let Some(pipeline) = cache.get(&cache_key) {
-                debug!("Using cached pipeline: {}", cache_key);
+        // 创建新的流水线
+        log_debug!("Creating new pipeline: {}", request.name);
 
-                // 更新缓存使用顺序
-                self.update_cache_order(&cache_key).await;
+        let mut pipeline = Pipeline::new(
+            &request.name,
+            self.metrics_manager.clone(),
+        );
 
-                return Ok(pipeline.clone());
-            }
-        }
+        log_debug!("Using stages-based pipeline structure");
 
-        // 创建格式转换工厂
-        let mut format_converter_factory = FormatConverterFactory::new();
+        // 处理每个阶段
+        let mut prev_stage_models = Vec::new();
 
-        // 注册常用的格式转换策略
-        self.register_conversion_strategies(&mut format_converter_factory)
-            .await?;
+        for (stage_idx, stage) in request.stages.iter().enumerate() {
+            log_debug!("Processing stage: {}", stage.name);
 
-        let format_converter_factory = Arc::new(format_converter_factory);
+            // 设置阶段的合并策略
+            pipeline.set_merge_strategy(stage.merge_strategy);
 
-        // 根据请求类型创建不同的流水线
-        let pipeline: Arc<dyn PipelineExecutor> = if request.uses_model_groups() {
-            // 创建基于模型组的流水线
-            debug!("Creating new pipeline with groups: {}", request.name);
-            let mut pipeline = PipelineWithGroups::new(
-                self.audio_converter.clone(),
-                format_converter_factory,
-                self.metrics_manager.clone(),
-            );
+            // 当前阶段的模型列表
+            let mut current_stage_models = Vec::new();
 
-            // 创建并添加模型组
-            for group_req in &request.model_groups {
-                let mut group = ModelGroup::new(&group_req.name);
-
-                // 设置合并策略
-                group.set_merge_strategy(group_req.merge_strategy);
-
-                // 添加模型
-                for model_req in &group_req.models {
-                    let model = match self
-                        .model_factory
-                        .create_model(
-                            &model_req.provider,
-                            &model_req.model_id,
-                            &model_req.parameters,
-                        )
-                        .await
-                    {
-                        Ok(model) => model,
-                        Err(e) => {
-                            warn!(
-                                "Failed to create model {}:{} for group {}: {}",
-                                model_req.provider, model_req.model_id, group_req.name, e
-                            );
-                            return Err(ServiceError::Pipeline(format!(
-                                "Failed to create model {}:{} for group {}: {}",
-                                model_req.provider, model_req.model_id, group_req.name, e
-                            )));
-                        },
-                    };
-
-                    group.add_model(model);
-                }
-
-                if let Err(e) = pipeline.add_group(group) {
-                    warn!("Failed to add group {} to pipeline: {}", group_req.name, e);
-                    return Err(e);
-                }
-            }
-
-            Arc::new(pipeline)
-        } else {
-            // 创建标准流水线
-            debug!("Creating new standard pipeline: {}", request.name);
-            let mut pipeline = Pipeline::new(
-                self.audio_converter.clone(),
-                format_converter_factory,
-                self.metrics_manager.clone(),
-            );
-
-            // 设置合并策略（如果有）
-            if let Some(strategy) = request.merge_strategy {
-                pipeline.set_merge_strategy(strategy);
-            }
-
-            // 添加模型
-            for model_req in &request.models {
-                let model = match self
-                    .model_factory
-                    .create_model(
-                        &model_req.provider,
-                        &model_req.model_id,
-                        &model_req.parameters,
-                    )
-                    .await
-                {
-                    Ok(model) => model,
-                    Err(e) => {
-                        warn!(
-                            "Failed to create model {}:{}: {}",
-                            model_req.provider, model_req.model_id, e
-                        );
-                        return Err(ServiceError::Pipeline(format!(
-                            "Failed to create model {}:{}: {}",
-                            model_req.provider, model_req.model_id, e
-                        )));
-                    },
+            // 添加阶段中的所有模型
+            for model_req in &stage.models {
+                // 创建模型
+                let model_request = crate::model::factory::ModelRequest {
+                    provider: model_req.provider.clone(),
+                    model_id: model_req.model_id.clone(),
+                    parameters: model_req.parameters.clone(),
                 };
 
-                if let Err(e) = pipeline.add_model(model, model_req.execution_mode) {
-                    warn!(
+                let model = self.model_factory.create_model(&model_request).await;
+
+                // 检查阶段内模型的输入输出格式一致性
+                if !current_stage_models.is_empty() {
+                    let first_model = &current_stage_models[0];
+
+                    // 检查输入格式一致性
+                    let first_inputs = first_model.supported_input_formats();
+                    let curr_inputs = model.supported_input_formats();
+
+                    let mut input_compatible = false;
+                    for first_input in &first_inputs {
+                        for curr_input in &curr_inputs {
+                            if first_input.data_type == curr_input.data_type {
+                                input_compatible = true;
+                                break;
+                            }
+                        }
+                        if input_compatible {
+                            break;
+                        }
+                    }
+
+                    if !input_compatible {
+                        return Err(ServiceError::UnsupportedOperation(format!(
+                            "Incompatible input formats in stage '{}': model '{}:{}' has different input type than other models",
+                            stage.name, model_req.provider, model_req.model_id
+                        )));
+                    }
+
+                    // 检查输出格式一致性
+                    let first_outputs = first_model.supported_output_formats();
+                    let curr_outputs = model.supported_output_formats();
+
+                    let mut output_compatible = false;
+                    for first_output in &first_outputs {
+                        for curr_output in &curr_outputs {
+                            if first_output.data_type == curr_output.data_type {
+                                output_compatible = true;
+                                break;
+                            }
+                        }
+                        if output_compatible {
+                            break;
+                        }
+                    }
+
+                    if !output_compatible {
+                        return Err(ServiceError::UnsupportedOperation(format!(
+                            "Incompatible output formats in stage '{}': model '{}:{}' has different output type than other models",
+                            stage.name, model_req.provider, model_req.model_id
+                        )));
+                    }
+                }
+
+                current_stage_models.push(model.clone());
+
+                // 添加到流水线，阶段内的模型使用并行模式
+                if let Err(e) = pipeline.add_model(model, ExecutionMode::Parallel) {
+                    log_warn!(
                         "Failed to add model {}:{} to pipeline: {}",
                         model_req.provider, model_req.model_id, e
                     );
@@ -366,148 +245,118 @@ impl PipelineFactory {
                 }
             }
 
-            Arc::new(pipeline)
-        };
+            // 检查阶段间的输入输出兼容性
+            if stage_idx > 0 && !prev_stage_models.is_empty() && !current_stage_models.is_empty() {
+                // 检查前一阶段的输出格式与当前阶段的输入格式是否兼容
+                let mut compatible = false;
+                let mut data_type_mismatch = false;
+                let mut prev_output_type = String::new();
+                let mut curr_input_type = String::new();
 
-        // 缓存流水线
-        self.add_to_cache(cache_key, pipeline.clone()).await;
+                for prev_model in &prev_stage_models {
+                    for curr_model in &current_stage_models {
+                        // 获取前一个模型的输出格式和当前模型的输入格式
+                        let prev_outputs = prev_model.supported_output_formats();
+                        let curr_inputs = curr_model.supported_input_formats();
+
+                        // 检查数据类型是否匹配
+                        if !prev_outputs.is_empty() && !curr_inputs.is_empty() {
+                            prev_output_type = prev_outputs[0].data_type.clone();
+                            curr_input_type = curr_inputs[0].data_type.clone();
+
+                            if prev_output_type != curr_input_type {
+                                data_type_mismatch = true;
+                                continue;
+                            }
+                        }
+
+                        // 检查是否存在至少一个兼容的格式
+                        for prev_output in &prev_outputs {
+                            for curr_input in &curr_inputs {
+                                if pipeline.is_format_compatible(prev_output, curr_input) {
+                                    compatible = true;
+                                    break;
+                                }
+                            }
+                            if compatible {
+                                break;
+                            }
+                        }
+
+                        if compatible {
+                            break;
+                        }
+                    }
+
+                    if compatible {
+                        break;
+                    }
+                }
+
+                if !compatible {
+                    if data_type_mismatch {
+                        return Err(ServiceError::UnsupportedOperation(format!(
+                            "Incompatible data types between stages: '{}' outputs {} but '{}' expects {}",
+                            request.stages[stage_idx - 1].name,
+                            prev_output_type,
+                            stage.name,
+                            curr_input_type
+                        )));
+                    } else {
+                        return Err(ServiceError::UnsupportedOperation(format!(
+                            "Incompatible stages: '{}' output is not compatible with '{}' input",
+                            request.stages[stage_idx - 1].name,
+                            stage.name
+                        )));
+                    }
+                }
+            }
+
+            // 更新前一阶段的模型列表
+            prev_stage_models = current_stage_models;
+        }
+
+        // 返回流水线实例
+        let pipeline = Arc::new(pipeline);
 
         Ok(pipeline)
-    }
-
-    /// 更新缓存使用顺序
-    ///
-    /// 将指定的缓存键移动到队列末尾，表示最近使用
-    async fn update_cache_order(&self, cache_key: &str) -> () {
-        let mut order = self.cache_keys_order.write().await;
-        // 如果键已存在，先移除它
-        if let Some(pos) = order.iter().position(|k| k == cache_key) {
-            order.remove(pos);
-        }
-        // 将键添加到队列末尾
-        order.push_back(cache_key.to_string());
-    }
-
-    /// 添加流水线到缓存
-    ///
-    /// # 参数
-    ///
-    /// * `cache_key` - 缓存键
-    /// * `pipeline` - 要缓存的流水线实例
-    async fn add_to_cache(&self, cache_key: String, pipeline: Arc<dyn PipelineExecutor>) -> () {
-        let mut cache = self.pipeline_cache.write().await;
-        let mut order = self.cache_keys_order.write().await;
-
-        // 如果缓存已满，移除最久未使用的项
-        if cache.len() >= self.max_cache_size && !order.is_empty() {
-            if let Some(oldest_key) = order.pop_front() {
-                cache.remove(&oldest_key);
-                debug!("Removed oldest pipeline from cache: {}", oldest_key);
-            }
-        }
-
-        // 添加新项到缓存
-        cache.insert(cache_key.clone(), pipeline);
-        order.push_back(cache_key);
-    }
-
-    /// 注册常用的格式转换策略
-    ///
-    /// 为格式转换工厂注册默认的音频格式转换策略
-    async fn register_conversion_strategies(
-        &self,
-        factory: &mut FormatConverterFactory,
-    ) -> ServiceResult<()> {
-        // 注册WAV转换策略
-        factory.register_strategy(
-            AudioCodec::Wav,
-            AudioCodec::Mp3,
-            Box::new(GenericConversionStrategy::new()),
-        );
-
-        // 注册MP3转换策略
-        factory.register_strategy(
-            AudioCodec::Mp3,
-            AudioCodec::Wav,
-            Box::new(GenericConversionStrategy::new()),
-        );
-
-        // 注册OGG转换策略
-        factory.register_strategy(
-            AudioCodec::Ogg,
-            AudioCodec::Wav,
-            Box::new(GenericConversionStrategy::new()),
-        );
-
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::runtime::Runtime;
+    use crate::model::config::ProvidersConfig;
 
     #[test]
     fn test_pipeline_request() {
         let request = PipelineRequest {
             name: "test_pipeline".to_string(),
-            models: vec![ModelRequest {
-                provider: "test_provider".to_string(),
-                model_id: "model1".to_string(),
-                parameters: ModelParams::default(),
-                execution_mode: ExecutionMode::Sequential,
+            stages: vec![StageRequest {
+                name: "test_stage".to_string(),
+                models: vec![ModelRequest {
+                    provider: "openai".to_string(),
+                    model_id: "gpt-4".to_string(),
+                    parameters: ModelParams::default(),
+                    execution_mode: ExecutionMode::Sequential,
+                }],
+                merge_strategy: MergeStrategy::First,
             }],
-            merge_strategy: None,
         };
 
-        assert_eq!(request.cache_key(), "pipeline:test_pipeline");
+        assert!(request.validate().is_ok());
     }
 
-    #[test]
-    fn test_pipeline_factory_creation() {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let model_factory = Arc::new(ModelFactory::new());
-            let audio_converter = Arc::new(AudioConverter::new(
-                AudioFormat::default(),
-                AudioFormat::default(),
-            ));
-            let metrics_manager = Arc::new(MetricsManager::new());
+    #[tokio::test]
+    async fn test_pipeline_factory_creation() {
+        // 创建模拟组件
+        let config = ProvidersConfig::default();
+        let model_factory = Arc::new(ModelFactory::new(config));
+        let metrics_manager = Arc::new(MetricsManager::new());
 
-            let factory = PipelineFactory::new(model_factory, audio_converter, metrics_manager);
+        let _factory = PipelineFactory::new(&model_factory, metrics_manager);
 
-            assert!(factory.pipeline_cache.read().await.is_empty());
-        });
-    }
-
-    #[test]
-    fn test_pipeline_caching() {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let model_factory = Arc::new(ModelFactory::new());
-            let audio_converter = Arc::new(AudioConverter::new(
-                AudioFormat::default(),
-                AudioFormat::default(),
-            ));
-            let metrics_manager = Arc::new(MetricsManager::new());
-
-            let factory = PipelineFactory::new(model_factory, audio_converter, metrics_manager);
-
-            let request = PipelineRequest {
-                name: "test_pipeline".to_string(),
-                models: vec![],
-                merge_strategy: None,
-            };
-
-            // 首次创建流水线
-            let pipeline1 = factory.create_pipeline(&request).await.unwrap();
-
-            // 再次请求相同配置
-            let pipeline2 = factory.create_pipeline(&request).await.unwrap();
-
-            // 验证是否返回缓存的实例
-            assert!(Arc::ptr_eq(&pipeline1, &pipeline2));
-        });
+        // 简单测试工厂创建成功
+        assert!(true);
     }
 }

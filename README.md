@@ -1,9 +1,11 @@
 # model_concat
 
 #### 介绍
+
 模型串联编排服务是一个灵活的模型服务编排系统，支持多个AI模型的串联调用和并行处理。本服务可以处理不同形式的输入输出（文本、音频等），并提供便捷的音频格式转换工具。
 
 #### 软件架构
+
 系统主要包含以下核心组件：
 
 1. 模型输入输出管理
@@ -17,7 +19,7 @@
 
 3. 模型服务层
    - 统一的模型服务接口
-   - 支持HTTP和WebSocket连接
+   - 支持WebSocket连接
    - 标准化的前处理、处理和后处理流程
 
 4. 编排引擎
@@ -36,14 +38,15 @@
 #### 使用说明
 
 1. 交互方式
-   - HTTP API（适用于单次请求）
-   - WebSocket（适用于流式处理）
+   - HTTP API（仅用于查询服务信息）
+   - WebSocket（用于模型处理和流式通信）
 
 2. HTTP API 接口
    ```
-   POST /tasks           # 创建处理任务
-   GET  /tasks/{id}      # 获取任务状态
-   GET  /tasks/{id}/result  # 获取任务结果
+   GET  /providers            # 获取所有服务商
+   GET  /providers/{provider}/models  # 获取服务商支持的模型
+   GET  /models/{provider}/{model_id}  # 获取模型详情
+   GET  /metrics             # 获取性能监控数据
    ```
 
 3. WebSocket 接口
@@ -52,20 +55,6 @@
    ```
 
 4. 交互流程示例
-
-   HTTP流程：
-   ```
-   Client                              Server
-     |                                   |
-     |------ POST /tasks -------->| 创建任务
-     |<---- 返回task_id和状态 -----------|
-     |                                   |
-     |--- GET /tasks/{id}/status ------->| 轮询状态
-     |<---- 返回处理进度 ----------------|
-     |                                   |
-     |--- GET /tasks/{id}/result ------->| 获取结果
-     |<---- 返回处理结果 ----------------|
-   ```
 
    WebSocket流程：
    ```
@@ -89,69 +78,91 @@
 
 5. 请求示例
 
-   HTTP请求：
-   ```json
-   POST /tasks
-   {
-     "task_id": "task-123",
-     "pipeline": {
-       "name": "speech_analysis",
-       "stages": [
-         {
-           "name": "speech_to_text",
-           "models": [
-             {
-               "provider": "openai",
-               "model_id": "whisper",
-               "parameters": {
-                 "language": "zh"
-               }
-             }
-           ]
-         }
-       ]
-     },
-     "input": {
-       "type": "audio",
-       "data": {
-         "content": "base64_audio_data",
-         "format": {
-           "codec": "mp3",
-           "sample_rate": 16000,
-           "channels": 1
-         }
-       }
-     }
-   }
-   ```
-
    WebSocket消息：
-   ```json
-   // 客户端发送
-   {
-     "type": "Start",
-     "data": {
-       "pipeline": {
+
+```json
+{
+   "type": "Start",
+   "data": {
+      "pipeline": {
          "name": "realtime_translation",
          "stages": [
-           {
-             "name": "speech_to_text",
-             "models": [{"provider": "openai", "model_id": "whisper"}]
-           }
+            {
+               "name": "speech_to_text",
+               "models": [
+                  {
+                     "provider": "openai",
+                     "model_id": "whisper"
+                  }
+               ]
+            },
+            {
+               "name": "translation",
+               "merge_strategy": "First",
+               "models": [
+                  {
+                     "provider": "openai",
+                     "model_id": "gpt-4"
+                  },
+                  {
+                     "provider": "openai",
+                     "model_id": "gpt-4o"
+                  }
+               ]
+            }
          ]
-       },
-       "input": {
+      },
+      "input": {
          "type": "audio",
          "data": {
-           "content": "streaming_audio_data",
-           "format": {
-             "codec": "wav",
-             "sample_rate": 16000,
-             "channels": 1
-           }
+            "content": "streaming_audio_data",
+            "format": {
+               "codec": "wav",
+               "sample_rate": 16000,
+               "channels": 1
+            }
          }
-       }
-     }
+      }
    }
-   ```
+}
+```
 
+服务器响应：
+
+```json
+{
+   "type": "Progress",
+   "data": {
+      "stage": "speech_to_text",
+      "progress": 45,
+      "intermediate_result": "正在识别语音..."
+   }
+}
+```
+
+```json
+{
+   "type": "Result",
+   "data": {
+      "task_id": "task-123",
+      "output": {
+         "type": "text",
+         "data": "这是识别和翻译后的文本内容"
+      },
+      "elapsed_ms": 2500
+   }
+}
+```
+
+6. 执行模式说明
+
+   系统采用分阶段(Stage)执行模式：
+   - **阶段(Stage)**：每个阶段包含一组模型，阶段之间按顺序执行，前一个阶段的输出作为后一个阶段的输入
+   - **阶段内并行**：同一阶段内的多个模型并行执行，然后根据合并策略选择最终结果
+
+   合并策略包括：
+   - **First**：使用第一个结果
+   - **Last**：使用最后一个结果
+   - **Longest**：使用最大长度的结果
+   - **Shortest**：使用最小长度的结果
+   - **Concat**：合并所有结果（适用于文本）

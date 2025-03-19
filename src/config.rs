@@ -1,55 +1,20 @@
 use crate::error::{ServiceError, ServiceResult};
-use crate::model::adapters::api_provider::ApiProviderConfig;
+use crate::model::{ProviderConfig, ProvidersConfig};
 use crate::{log_error, log_info};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::fs;
 use tracing::{error, info};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    #[serde(default)]
-    pub ollama: HashMap<String, OllamaConfig>,
     pub server: ServerConfig,
-    pub stages: Vec<StageConfig>,
-    pub audio: AudioConfig,
-    #[serde(default)]
-    pub api_providers: HashMap<String, ApiProviderConfig>,
+    pub api_providers: ProvidersConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct StageConfig {
-    pub name: String,
-    pub models: Vec<ModelConfig>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct OllamaConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub protocol: String,
-    pub timeout_sec: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ModelConfig {
-    pub name: String,
-    pub url: String,
-    pub timeout: u64,
-    pub retry_count: u32,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct AudioConfig {
-    pub supported_formats: Vec<String>,
-    pub max_file_size: usize,
-    pub default_sample_rate: u32,
 }
 
 impl Config {

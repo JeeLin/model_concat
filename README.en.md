@@ -17,7 +17,7 @@ The system consists of the following core components:
 
 3. Model Service Layer
    - Unified model service interface
-   - HTTP and WebSocket connection support
+   - WebSocket connection support
    - Standardized pre-processing, processing, and post-processing pipeline
 
 4. Orchestration Engine
@@ -36,36 +36,23 @@ The system consists of the following core components:
 #### Instructions
 
 1. Interaction Methods
-   - HTTP API (for single requests)
-   - WebSocket (for streaming data)
+   - HTTP API (for service information queries only)
+   - WebSocket (for model processing and streaming communication)
 
 2. HTTP API Endpoints
    ```
-   POST /api/v1/tasks           # Create processing task
-   GET  /api/v1/tasks/{id}      # Get task status
-   GET  /api/v1/tasks/{id}/result  # Get task result
+   GET  /providers            # Get all providers
+   GET  /providers/{provider}/models  # Get provider's supported models
+   GET  /models/{provider}/{model_id}  # Get model details
+   GET  /metrics             # Get performance metrics
    ```
 
 3. WebSocket Endpoint
    ```
-   WS   /api/v1/ws             # WebSocket connection
+   WS   /ws             # WebSocket connection
    ```
 
 4. Interaction Flow Examples
-
-   HTTP Flow:
-   ```
-   Client                              Server
-     |                                   |
-     |------ POST /api/v1/tasks -------->| Create Task
-     |<---- Return task_id & status -----|
-     |                                   |
-     |--- GET /tasks/{id}/status ------->| Poll Status
-     |<---- Return progress -------------|
-     |                                   |
-     |--- GET /tasks/{id}/result ------->| Get Result
-     |<---- Return result ---------------|
-   ```
 
    WebSocket Flow:
    ```
@@ -89,69 +76,51 @@ The system consists of the following core components:
 
 5. Request Examples
 
-   HTTP Request:
-   ```json
-   POST /api/v1/tasks
-   {
-     "task_id": "task-123",
-     "pipeline": {
-       "name": "speech_analysis",
-       "stages": [
-         {
-           "name": "speech_to_text",
-           "models": [
-             {
-               "provider": "openai",
-               "model_id": "whisper",
-               "parameters": {
-                 "language": "zh"
-               }
-             }
-           ]
-         }
-       ]
-     },
-     "input": {
-       "type": "audio",
-       "data": {
-         "content": "base64_audio_data",
-         "format": {
-           "codec": "mp3",
-           "sample_rate": 16000,
-           "channels": 1
-         }
-       }
-     }
-   }
-   ```
-
    WebSocket Message:
-   ```json
-   // Client Send
-   {
-     "type": "Start",
-     "data": {
-       "pipeline": {
+
+```json
+{
+   "type": "Start",
+   "data": {
+      "pipeline": {
          "name": "realtime_translation",
          "stages": [
-           {
-             "name": "speech_to_text",
-             "models": [{"provider": "openai", "model_id": "whisper"}]
-           }
+            {
+               "name": "speech_to_text",
+               "models": [
+                  {
+                     "provider": "openai",
+                     "model_id": "whisper"
+                  }
+               ]
+            },
+            {
+               "name": "translation",
+               "merge_strategy": "First",
+               "models": [
+                  {
+                     "provider": "openai",
+                     "model_id": "gpt-4"
+                  },
+                  {
+                     "provider": "openai",
+                     "model_id": "gpt-4o"
+                  }
+               ]
+            }
          ]
-       },
-       "input": {
+      },
+      "input": {
          "type": "audio",
          "data": {
-           "content": "streaming_audio_data",
-           "format": {
-             "codec": "wav",
-             "sample_rate": 16000,
-             "channels": 1
-           }
+            "content": "streaming_audio_data",
+            "format": {
+               "codec": "wav",
+               "sample_rate": 16000,
+               "channels": 1
+            }
          }
-       }
-     }
+      }
    }
-   ```
-
+}
+```

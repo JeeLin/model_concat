@@ -1,44 +1,25 @@
-use crate::model::DataType;
-/// WebSocket服务器模块
-///
-/// 提供了基于WebSocket的实时通信功能，包括：
-/// - 连接管理
-/// - 消息处理
-/// - 心跳检测
-/// - 错误处理
-///
-/// # 示例
-///
-/// ```rust
-/// use axum::extract::ws::WebSocketUpgrade;
-/// use crate::server::websocket::ws_handler;
-///
-/// async fn handle_ws(ws: WebSocketUpgrade) {
-///     ws.on_upgrade(|socket| handle_socket(socket));
-/// }
-/// ```
-use crate::orchestration::PipelineFactory;
-use crate::server::request::InputData;
-use crate::server::task::TaskResult;
+//! WebSocket服务模块
+//!
+//! 提供了基于WebSocket的实时通信功能，包括：
+//! - 连接管理
+//! - 消息处理
+//! - 流式数据传输
+//! - 错误处理
+
+use crate::model::{DataType, StreamMode};
+use crate::orchestration::{PipelineFactory, PipelineRequest};
+use crate::server::task::{TaskManager, TaskRequest, TaskStatus};
+use axum::response::IntoResponse;
 use axum::Extension;
-use axum::{
-    extract::ws::{Message, WebSocket},
-    extract::WebSocketUpgrade,
-    response::IntoResponse,
-};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-/// WebSocket 消息类型
-///
-/// 定义了所有支持的WebSocket消息格式
-#[derive(Debug, Serialize, Deserialize)]
+/// WebSocket消息类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WsMessage {
     /// 初始化连接
@@ -58,7 +39,7 @@ pub enum WsMessage {
 }
 
 /// 初始化消息
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsInitMessage {
     /// 客户端ID
     pub client_id: String,
@@ -67,16 +48,16 @@ pub struct WsInitMessage {
 }
 
 /// 开始处理消息
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsStartMessage {
-    /// 处理配置
-    pub pipeline: PipelineConfig,
+    /// 流水线配置
+    pub pipeline: PipelineRequest,
     /// 输入数据
-    pub input: InputData,
+    pub input: DataType,
 }
 
 /// 进度消息
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsProgressMessage {
     /// 当前处理阶段
     pub stage: String,
@@ -87,215 +68,349 @@ pub struct WsProgressMessage {
 }
 
 /// 结果消息
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsResultMessage {
-    /// 处理结果
-    pub result: TaskResult,
+    /// 任务ID
+    pub task_id: String,
+    /// 输出数据
+    pub output: DataType,
+    /// 处理耗时（毫秒）
+    pub elapsed_ms: u64,
 }
 
 /// 错误消息
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsErrorMessage {
     /// 错误代码
     pub code: String,
-    /// 错误信息
+    /// 错误消息
     pub message: String,
 }
 
-/// WebSocket 会话
+/// WebSocket连接处理函数
 ///
-/// 管理单个WebSocket连接的生命周期和状态
-///
-/// # 字段
-///
-/// * `client_id` - 客户端唯一标识
-/// * `heartbeat_interval` - 心跳检查时间间隔
-/// * `last_heartbeat` - 上次心跳时间
-/// * `pipeline_factory` - 流水线工厂实例
-pub struct WsSession {
-    /// 客户端ID
-    client_id: Option<String>,
-    /// 心跳检查间隔
-    heartbeat_interval: Duration,
-    /// 上次心跳时间
-    last_heartbeat: Instant,
-    /// 流水线工厂
-    pipeline_factory: Arc<PipelineFactory>,
-}
-
-impl WsSession {
-    /// 创建新的WebSocket会话
-    ///
-    /// # 参数
-    ///
-    /// * `pipeline_factory` - 流水线工厂实例
-    ///
-    /// # 返回值
-    ///
-    /// 返回新创建的WebSocket会话实例
-    pub fn new(pipeline_factory: Arc<PipelineFactory>) -> Self {
-        Self {
-            client_id: None,
-            heartbeat_interval: Duration::from_secs(30),
-            last_heartbeat: Instant::now(),
-            pipeline_factory,
-        }
-    }
-
-    /// 处理WebSocket连接
-    pub async fn handle_socket(self, socket: WebSocket) {
-        let (mut sender, mut receiver) = socket.split();
-        let (tx, mut rx) = mpsc::channel::<Message>(100);
-
-        // 心跳检查任务
-        let heartbeat_tx = tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if heartbeat_tx.send(Message::Ping(vec![])).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        // 消息发送任务
-        tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                if sender.send(message).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        // 消息接收处理
-        while let Some(result) = receiver.next().await {
-            match result {
-                Ok(Message::Text(text)) => {
-                    if let Ok(message) = serde_json::from_str::<WsMessage>(&text) {
-                        self.handle_message(message, tx.clone()).await;
-                    }
-                },
-                Ok(Message::Binary(bin)) => {
-                    self.handle_binary(bin, tx.clone()).await;
-                },
-                Ok(Message::Ping(_)) => {
-                    if tx.send(Message::Pong(vec![])).await.is_err() {
-                        break;
-                    }
-                },
-                Ok(Message::Close(_)) => break,
-                _ => {},
-            }
-        }
-    }
-
-    /// 处理WebSocket消息
-    async fn handle_message(&self, message: WsMessage, tx: mpsc::Sender<Message>) {
-        match message {
-            WsMessage::Init(init) => {
-                // 处理初始化消息
-                info!(
-                    "Initialized WebSocket connection with client: {}",
-                    init.client_id
-                );
-
-                // 发送确认消息
-                let response = WsMessage::Init(WsInitMessage {
-                    client_id: init.client_id,
-                    auth: None,
-                });
-                self.send_message(response, tx).await;
-            },
-            WsMessage::Start(start) => {
-                // 处理开始处理消息
-                info!("Starting pipeline processing");
-                // 这里应该实现实际的处理逻辑
-            },
-            WsMessage::Ping => {
-                self.send_message(WsMessage::Pong, tx).await;
-            },
-            _ => {},
-        }
-    }
-
-    /// 处理二进制消息
-    async fn handle_binary(&self, data: Vec<u8>, tx: mpsc::Sender<Message>) {
-        // 处理二进制数据，例如音频
-        debug!("Received binary data: {} bytes", data.len());
-    }
-
-    /// 发送WebSocket消息
-    async fn send_message(&self, message: WsMessage, tx: mpsc::Sender<Message>) {
-        if let Ok(json) = serde_json::to_string(&message) {
-            let _ = tx.send(Message::Text(json)).await;
-        }
-    }
-}
-
-/// WebSocket处理函数
+/// 处理WebSocket连接请求，建立连接并处理消息
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    Extension(pipeline_factory): Extension<Arc<PipelineFactory>>,
+    Extension(task_manager): Extension<Arc<TaskManager>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, pipeline_factory))
+    ws.on_upgrade(move |socket| handle_socket(socket, task_manager))
 }
 
-async fn handle_socket(mut socket: WebSocket, pipeline_factory: Arc<PipelineFactory>) {
-    while let Some(msg) = socket.recv().await {
-        if let Ok(msg) = msg {
-            match msg {
-                Message::Text(text) => {
-                    let input = DataType::Text(text);
-                    match pipeline_factory.execute(input).await {
-                        Ok(output) => {
-                            let response = match output {
-                                DataType::Text(text) => text,
-                                DataType::Audio { data, .. } => STANDARD.encode(data),
-                            };
-                            if let Err(e) = socket.send(Message::Text(response)).await {
-                                debug!("Failed to send response: {}", e);
-                                break;
-                            }
-                        },
-                        Err(e) => {
-                            if let Err(e) = socket.send(Message::Text(e.to_string())).await {
-                                debug!("Failed to send error: {}", e);
-                                break;
-                            }
-                        },
-                    }
-                },
-                Message::Binary(bin) => {
-                    let input = DataType::Audio {
-                        data: bin,
-                        format: Default::default(),
-                    };
-                    match pipeline_factory.execute(input).await {
-                        Ok(output) => {
-                            let response = match output {
-                                DataType::Text(text) => Message::Text(text),
-                                DataType::Audio { data, .. } => Message::Binary(data),
-                            };
-                            if let Err(e) = socket.send(response).await {
-                                debug!("Failed to send response: {}", e);
-                                break;
-                            }
-                        },
-                        Err(e) => {
-                            if let Err(e) = socket.send(Message::Text(e.to_string())).await {
-                                debug!("Failed to send error: {}", e);
-                                break;
-                            }
-                        },
-                    }
-                },
-                Message::Close(_) => break,
-                _ => {},
+/// 处理WebSocket连接
+async fn handle_socket(socket: WebSocket, task_manager: Arc<TaskManager>) {
+    // 分离WebSocket的发送和接收部分
+    let (mut sender, mut receiver) = socket.split();
+
+    // 创建消息通道
+    let (tx, mut rx) = mpsc::channel::<Message>(100);
+
+    // 客户端ID
+    let mut client_id = String::new();
+
+    // 最后活动时间
+    let mut last_activity = Instant::now();
+
+    // 心跳检查间隔
+    let heartbeat_interval = Duration::from_secs(30);
+
+    // 启动发送任务
+    let send_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if sender.send(message).await.is_err() {
+                break;
             }
-        } else {
-            break;
+        }
+    });
+
+    // 处理接收到的消息
+    while let Some(result) = receiver.next().await {
+        last_activity = Instant::now();
+
+        match result {
+            Ok(message) => {
+                match message {
+                    Message::Text(text) => {
+                        // 解析消息
+                        match serde_json::from_str::<WsMessage>(&text) {
+                            Ok(ws_message) => {
+                                match ws_message {
+                                    WsMessage::Init(init) => {
+                                        // 处理初始化消息
+                                        client_id = init.client_id;
+                                        info!("WebSocket客户端连接: {}", client_id);
+
+                                        // 发送确认消息
+                                        let response = WsMessage::Pong;
+                                        if let Ok(response_text) = serde_json::to_string(&response)
+                                        {
+                                            let _ = tx.send(Message::Text(response_text)).await;
+                                        }
+                                    },
+                                    WsMessage::Start(start) => {
+                                        // 处理开始消息
+                                        info!("接收处理请求: {}", client_id);
+
+                                        // 创建任务
+                                        let task_request = TaskRequest {
+                                            task_id: None,
+                                            pipeline: start.pipeline,
+                                            input: start.input,
+                                            callback_url: None,
+                                        };
+
+                                        // 克隆发送通道
+                                        let tx_clone = tx.clone();
+                                        let task_manager_clone = task_manager.clone();
+
+                                        // 启动异步处理任务
+                                        tokio::spawn(async move {
+                                            match task_manager_clone.create_task(task_request).await
+                                            {
+                                                Ok(task_id) => {
+                                                    // 发送进度更新
+                                                    let mut last_status = None;
+                                                    let start_time = Instant::now();
+
+                                                    // 定期检查任务状态
+                                                    loop {
+                                                        match task_manager_clone
+                                                            .get_task_status(&task_id)
+                                                            .await
+                                                        {
+                                                            Ok(status) => {
+                                                                match &status {
+                                                                    TaskStatus::Pending => {
+                                                                        // 任务等待中
+                                                                        if last_status.is_none() {
+                                                                            let progress = WsMessage::Progress(WsProgressMessage {
+                                                                                stage: "等待处理".to_string(),
+                                                                                progress: 0,
+                                                                                intermediate_result: None,
+                                                                            });
+
+                                                                            if let Ok(text) = serde_json::to_string(&progress) {
+                                                                                let _ = tx_clone.send(Message::Text(text)).await;
+                                                                            }
+
+                                                                            last_status = Some(
+                                                                                status.clone(),
+                                                                            );
+                                                                        }
+                                                                    },
+                                                                    TaskStatus::Processing {
+                                                                        model,
+                                                                        progress,
+                                                                    } => {
+                                                                        // 任务处理中
+                                                                        let progress_msg = WsMessage::Progress(WsProgressMessage {
+                                                                            stage: model.clone(),
+                                                                            progress: *progress,
+                                                                            intermediate_result: None,
+                                                                        });
+
+                                                                        if let Ok(text) =
+                                                                            serde_json::to_string(
+                                                                                &progress_msg,
+                                                                            )
+                                                                        {
+                                                                            let _ = tx_clone
+                                                                                .send(
+                                                                                    Message::Text(
+                                                                                        text,
+                                                                                    ),
+                                                                                )
+                                                                                .await;
+                                                                        }
+
+                                                                        last_status =
+                                                                            Some(status.clone());
+                                                                    },
+                                                                    TaskStatus::Completed {
+                                                                        result,
+                                                                    } => {
+                                                                        // 任务完成
+                                                                        let elapsed =
+                                                                            start_time.elapsed();
+                                                                        let elapsed_ms = elapsed
+                                                                            .as_millis()
+                                                                            as u64;
+
+                                                                        let result_msg =
+                                                                            WsMessage::Result(
+                                                                                WsResultMessage {
+                                                                                    task_id:
+                                                                                    task_id
+                                                                                        .clone(),
+                                                                                    output: result
+                                                                                        .output
+                                                                                        .clone(),
+                                                                                    elapsed_ms,
+                                                                                },
+                                                                            );
+
+                                                                        if let Ok(text) =
+                                                                            serde_json::to_string(
+                                                                                &result_msg,
+                                                                            )
+                                                                        {
+                                                                            let _ = tx_clone
+                                                                                .send(
+                                                                                    Message::Text(
+                                                                                        text,
+                                                                                    ),
+                                                                                )
+                                                                                .await;
+                                                                        }
+
+                                                                        break;
+                                                                    },
+                                                                    TaskStatus::Failed {
+                                                                        error,
+                                                                    } => {
+                                                                        // 任务失败
+                                                                        let error_msg = WsMessage::Error(WsErrorMessage {
+                                                                            code: "TASK_FAILED".to_string(),
+                                                                            message: error.clone(),
+                                                                        });
+
+                                                                        if let Ok(text) =
+                                                                            serde_json::to_string(
+                                                                                &error_msg,
+                                                                            )
+                                                                        {
+                                                                            let _ = tx_clone
+                                                                                .send(
+                                                                                    Message::Text(
+                                                                                        text,
+                                                                                    ),
+                                                                                )
+                                                                                .await;
+                                                                        }
+
+                                                                        break;
+                                                                    },
+                                                                }
+                                                            },
+                                                            Err(e) => {
+                                                                // 获取任务状态失败
+                                                                let error_msg = WsMessage::Error(
+                                                                    WsErrorMessage {
+                                                                        code: "STATUS_ERROR"
+                                                                            .to_string(),
+                                                                        message: format!(
+                                                                            "获取任务状态失败: {}",
+                                                                            e
+                                                                        ),
+                                                                    },
+                                                                );
+
+                                                                if let Ok(text) =
+                                                                    serde_json::to_string(
+                                                                        &error_msg,
+                                                                    )
+                                                                {
+                                                                    let _ = tx_clone
+                                                                        .send(Message::Text(text))
+                                                                        .await;
+                                                                }
+
+                                                                break;
+                                                            },
+                                                        }
+
+                                                        // 等待一段时间再检查
+                                                        tokio::time::sleep(Duration::from_millis(
+                                                            500,
+                                                        ))
+                                                            .await;
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    // 创建任务失败
+                                                    let error_msg =
+                                                        WsMessage::Error(WsErrorMessage {
+                                                            code: "TASK_CREATE_ERROR".to_string(),
+                                                            message: format!("创建任务失败: {}", e),
+                                                        });
+
+                                                    if let Ok(text) =
+                                                        serde_json::to_string(&error_msg)
+                                                    {
+                                                        let _ = tx_clone
+                                                            .send(Message::Text(text))
+                                                            .await;
+                                                    }
+                                                },
+                                            }
+                                        });
+                                    },
+                                    WsMessage::Ping => {
+                                        // 处理心跳消息
+                                        let pong = WsMessage::Pong;
+                                        if let Ok(text) = serde_json::to_string(&pong) {
+                                            let _ = tx.send(Message::Text(text)).await;
+                                        }
+                                    },
+                                    _ => {
+                                        // 忽略其他类型的消息
+                                        warn!("收到未处理的WebSocket消息类型");
+                                    },
+                                }
+                            },
+                            Err(e) => {
+                                // 消息解析失败
+                                error!("WebSocket消息解析失败: {}", e);
+                                let error_msg = WsMessage::Error(WsErrorMessage {
+                                    code: "PARSE_ERROR".to_string(),
+                                    message: format!("消息解析失败: {}", e),
+                                });
+
+                                if let Ok(text) = serde_json::to_string(&error_msg) {
+                                    let _ = tx.send(Message::Text(text)).await;
+                                }
+                            },
+                        }
+                    },
+                    Message::Binary(_) => {
+                        // 暂不处理二进制消息
+                        warn!("收到二进制WebSocket消息，暂不支持");
+                    },
+                    Message::Ping(_) => {
+                        // 响应Ping消息
+                        let _ = tx.send(Message::Pong(vec![])).await;
+                    },
+                    Message::Pong(_) => {
+                        // 忽略Pong消息
+                    },
+                    Message::Close(_) => {
+                        // 关闭连接
+                        break;
+                    },
+                }
+            },
+            Err(e) => {
+                // WebSocket错误
+                error!("WebSocket错误: {}", e);
+                break;
+            },
+        }
+
+        // 检查是否需要发送心跳
+        if last_activity.elapsed() > heartbeat_interval {
+            // 发送Ping消息
+            let ping = WsMessage::Ping;
+            if let Ok(text) = serde_json::to_string(&ping) {
+                if tx.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+
+            last_activity = Instant::now();
         }
     }
-    info!("WebSocket connection closed");
+
+    // 连接关闭，取消发送任务
+    send_task.abort();
+    info!("WebSocket连接关闭: {}", client_id);
 }

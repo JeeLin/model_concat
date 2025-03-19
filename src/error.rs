@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-use crate::model::adapter_error::AdapterError;
+use std::io::Error;
 use thiserror::Error;
 
 /// 服务错误类型
@@ -45,7 +45,7 @@ pub enum ServiceError {
 
     /// 音频错误
     #[error("Audio error: {0}")]
-    AudioEncoding(Err),
+    AudioEncoding(Error),
 
     /// 音频转换错误
     #[error("Audio conversion error: {0}")]
@@ -58,10 +58,6 @@ pub enum ServiceError {
     /// 不支持的格式
     #[error("Unsupported format: {0}")]
     UnsupportedFormat(String),
-
-    /// 模型错误
-    #[error("Model error: {0}")]
-    AdapterError(AdapterError),
 
     /// 不支持的操作
     #[error("Unsupported operation: {0}")]
