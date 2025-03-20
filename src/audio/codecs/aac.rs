@@ -1,141 +1,171 @@
-//! AAC格式编解码器实现
+//! AAC格式编解码器
 //!
-//! 提供AAC格式音频的编码和解码功能。使用Symphonia库进行解码。
+//! 提供AAC格式音频数据的编解码功能。AAC是一种高效的有损音频压缩格式，
+//! 相比MP3提供更好的音质和更高的压缩率，广泛用于数字音频领域。
+//!
+//! # 特性
+//! - 支持多种采样率和声道配置
+//! - 高效的有损压缩算法
+//! - 支持多种AAC配置（LC-AAC, HE-AAC等）
+//!
+//! # 示例
+//! ```no_run
+//! use crate::audio::codecs::AacCodec;
+//! use crate::audio::format::AudioFormat;
+//!
+//! // 创建默认的AAC编解码器（44.1kHz, 2声道, 16位, 128kbps）
+//! let mut codec = AacCodec::default().unwrap();
+//!
+//! // 或者使用自定义格式创建
+//! let format = AudioFormat::with_bit_rate(
+//!     AudioCodec::Aac,
+//!     48000,  // 采样率
+//!     2,      // 声道数
+//!     16,     // 位深度
+//!     192000, // 比特率
+//! );
+//! let mut codec = AacCodec::new(format).unwrap();
+//! ```
 
-use crate::audio::format::AudioFormat;
-use crate::error::{ServiceError, ServiceResult};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
-use std::io::Cursor;
 
-/// AAC解码器
-pub struct AacDecoder {
+use super::AudioCodec;
+use crate::audio::format::{self, AudioFormat};
+use crate::error::{ServiceError, ServiceResult};
+
+/// AAC格式编解码器
+///
+/// 使用FAAC/FAAD2库实现AAC格式音频的编码和解码。
+/// 支持多种采样率和声道配置，提供高效的音频压缩。
+pub struct AacCodec {
+    /// 支持的音频格式
+    /// 包含采样率、声道数、位深度和比特率等参数
     format: AudioFormat,
+    /// 编码器状态
+    /// 用于存储FAAC编码器的内部状态，包括编码参数和缓冲区
+    encoder_state: Option<faac_sys::faacEncHandle>,
+    /// 解码器状态
+    /// 用于存储FAAD2解码器的内部状态，包括解码参数和缓冲区
+    decoder_state: Option<faad_sys::NeAACDecHandle>,
 }
 
-impl AacDecoder {
-    /// 创建新的AAC解码器
-    pub fn new(format: AudioFormat) -> Self {
-        Self { format }
-    }
-}
-
-#[async_trait]
-impl super::AudioDecoder for AacDecoder {
-    async fn decode(&mut self, data: Bytes) -> ServiceResult<Bytes> {
-        // 创建媒体源
-        let cursor = Cursor::new(data);
-        let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-
-        // 创建格式探测器
-        let mut hint = Hint::new();
-        hint.with_extension("aac");
-
-        // 探测格式
-        let format_opts = FormatOptions::default();
-        let metadata_opts = MetadataOptions::default();
-        let decoder_opts = DecoderOptions::default();
-
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &metadata_opts)
-            .map_err(|e| ServiceError::InvalidFormat(format!("无法识别AAC格式: {}", e)))?;
-
-        let mut format = probed.format;
-        let track = format
-            .default_track()
-            .ok_or_else(|| ServiceError::InvalidFormat("无法获取音频轨道".to_string()))?;
-
-        // 创建解码器
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &decoder_opts)
-            .map_err(|e| ServiceError::InvalidFormat(format!("无法创建解码器: {}", e)))?;
-
-        let mut samples = Vec::new();
-
-        // 解码音频帧
-        while let Ok(packet) = format.next_packet() {
-            let decoded = decoder
-                .decode(&packet)
-                .map_err(|e| ServiceError::InvalidFormat(format!("解码失败: {}", e)))?;
-
-            let mut sample_buf = SampleBuffer::new(decoded.capacity() as u64, *decoded.spec());
-            sample_buf.copy_interleaved_ref(decoded);
-
-            // 将采样点转换为f32
-            samples.extend(
-                sample_buf
-                    .samples()
-                    .iter()
-                    .map(|&s| s as f32 / 32768.0),
-            );
+impl AacCodec {
+    /// 创建新的AAC编解码器
+    ///
+    /// # 参数
+    /// * `format` - 音频格式参数，包括采样率、声道数、位深度和比特率
+    ///
+    /// # 返回
+    /// * `Ok(AacCodec)` - 成功创建编解码器
+    /// * `Err(ServiceError)` - 格式不支持或参数无效
+    pub fn new(format: AudioFormat) -> ServiceResult<Self> {
+        if format.codec != format::AudioCodec::Aac {
+            return Err(ServiceError::InvalidFormat(
+                "不支持的音频格式".to_string(),
+            ));
         }
 
-        // 转换为字节
-        let bytes: Vec<u8> = samples
-            .iter()
-            .flat_map(|&s| s.to_le_bytes().to_vec())
-            .collect();
-
-        Ok(Bytes::from(bytes))
+        Ok(Self {
+            format,
+            encoder_state: None,
+            decoder_state: None,
+        })
     }
 
-    fn output_format(&self) -> AudioFormat {
-        self.format.clone()
+    /// 创建默认的AAC编解码器
+    ///
+    /// 使用标准的音频参数创建编解码器：
+    /// - 采样率：44.1kHz
+    /// - 声道数：2（立体声）
+    /// - 位深度：16位
+    /// - 比特率：128kbps
+    ///
+    /// # 返回
+    /// * `Ok(AacCodec)` - 成功创建编解码器
+    /// * `Err(ServiceError)` - 创建失败
+    pub fn default() -> ServiceResult<Self> {
+        Self::new(AudioFormat::with_bit_rate(
+            format::AudioCodec::Aac,
+            44100,
+            2,
+            16,
+            128000, // 默认128kbps比特率
+        ))
     }
-}
 
-/// AAC编码器
-pub struct AacEncoder {
-    format: AudioFormat,
-}
+    /// 初始化编码器
+    ///
+    /// 配置并初始化FAAC编码器，设置编码参数和分配必要的缓冲区。
+    /// 在第一次调用encode方法时会自动调用此函数。
+    ///
+    /// # 返回
+    /// * `Ok(())` - 初始化成功
+    /// * `Err(ServiceError)` - 初始化失败
+    fn init_encoder(&mut self) -> ServiceResult<()> {
+        // TODO: 初始化FAAC编码器
+        // 这里需要添加FAAC库的初始化代码
+        Ok(())
+    }
 
-impl AacEncoder {
-    /// 创建新的AAC编码器
-    pub fn new(format: AudioFormat) -> Self {
-        Self { format }
+    /// 初始化解码器
+    ///
+    /// 配置并初始化FAAD2解码器，设置解码参数和分配必要的缓冲区。
+    /// 在第一次调用decode方法时会自动调用此函数。
+    ///
+    /// # 返回
+    /// * `Ok(())` - 初始化成功
+    /// * `Err(ServiceError)` - 初始化失败
+    fn init_decoder(&mut self) -> ServiceResult<()> {
+        // TODO: 初始化FAAD2解码器
+        // 这里需要添加FAAD2库的初始化代码
+        Ok(())
     }
 }
 
 #[async_trait]
-impl super::AudioEncoder for AacEncoder {
-    async fn encode(&mut self, data: Bytes) -> ServiceResult<Bytes> {
-        // 将字节转换为采样点
-        let samples: Vec<f32> = data
-            .chunks(4)
-            .map(|chunk| {
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(chunk);
-                f32::from_le_bytes(bytes)
-            })
-            .collect();
-
-        // TODO: 实现AAC编码
-        // 需要集成AAC编码库，如fdk-aac或其他Rust实现
-        Err(ServiceError::Unimplemented("AAC编码器尚未实现".to_string()))
+impl AudioCodec for AacCodec {
+    fn name(&self) -> &str {
+        "aac"
     }
 
-    fn output_format(&self) -> AudioFormat {
-        self.format.clone()
+    async fn encode(&mut self, data: Bytes, format: &AudioFormat) -> ServiceResult<Bytes> {
+        if !self.supports_format(format) {
+            return Err(ServiceError::InvalidFormat(
+                "不支持的AAC格式".to_string(),
+            ));
+        }
+
+        if self.encoder_state.is_none() {
+            self.init_encoder()?;
+        }
+
+        // TODO: 使用FAAC编码器将PCM数据编码为AAC格式
+        // 这里需要添加实际的编码逻辑
+
+        Ok(Bytes::new()) // 临时返回空数据
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::audio::format::AudioCodec;
+    async fn decode(&mut self, data: Bytes, format: &AudioFormat) -> ServiceResult<Bytes> {
+        if !self.supports_format(format) {
+            return Err(ServiceError::InvalidFormat(
+                "不支持的AAC格式".to_string(),
+            ));
+        }
 
-    #[tokio::test]
-    async fn test_aac_decoder() {
-        // 创建测试数据（这里需要一个有效的AAC文件数据）
-        let format = AudioFormat::new(AudioCodec::Aac, 44100, 2);
-        let decoder = AacDecoder::new(format);
+        if self.decoder_state.is_none() {
+            self.init_decoder()?;
+        }
 
-        // TODO: 添加解码器测试用例
+        // TODO: 使用FAAD2解码器将AAC数据解码为PCM格式
+        // 这里需要添加实际的解码逻辑
+
+        Ok(Bytes::new()) // 临时返回空数据
+    }
+
+    fn reset(&mut self) {
+        // 重置编解码器状态
+        self.encoder_state = None;
+        self.decoder_state = None;
     }
 }

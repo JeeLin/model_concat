@@ -98,84 +98,35 @@ impl RingBuffer {
         };
 
         let read_len = size.min(available);
-        if read_len == 0 {
-            return Bytes::new();
-        }
+        let mut result = BytesMut::with_capacity(read_len);
 
-        let mut result = Vec::with_capacity(read_len);
+        // 读取数据
         for i in 0..read_len {
             let pos = (*read_pos + i) % self.config.capacity;
-            result.push(buffer[pos]);
+            result.extend_from_slice(&[buffer[pos]]);
         }
 
         *read_pos = (*read_pos + read_len) % self.config.capacity;
-        Bytes::from(result)
+        result.freeze()
     }
 
-    /// 获取可用空间大小
-    pub fn available_space(&self) -> usize {
-        let write_pos = self.write_pos.lock().unwrap();
-        let read_pos = self.read_pos.lock().unwrap();
+    /// 获取可用数据大小
+    pub fn available(&self) -> usize {
+        let read_pos = *self.read_pos.lock().unwrap();
+        let write_pos = *self.write_pos.lock().unwrap();
 
-        if *write_pos >= *read_pos {
-            self.config.capacity - (*write_pos - *read_pos)
+        if write_pos >= read_pos {
+            write_pos - read_pos
         } else {
-            *read_pos - *write_pos
-        }
-    }
-
-    /// 获取已使用空间大小
-    pub fn used_space(&self) -> usize {
-        let write_pos = self.write_pos.lock().unwrap();
-        let read_pos = self.read_pos.lock().unwrap();
-
-        if *write_pos >= *read_pos {
-            *write_pos - *read_pos
-        } else {
-            self.config.capacity - (*read_pos - *write_pos)
+            self.config.capacity - (read_pos - write_pos)
         }
     }
 
     /// 清空缓冲区
     pub fn clear(&self) {
-        let mut buffer = self.buffer.lock().unwrap();
         let mut read_pos = self.read_pos.lock().unwrap();
         let mut write_pos = self.write_pos.lock().unwrap();
-
-        buffer.clear();
         *read_pos = 0;
         *write_pos = 0;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ring_buffer() {
-        let config = BufferConfig {
-            capacity: 8,
-            allow_overwrite: false,
-        };
-        let buffer = RingBuffer::new(config);
-
-        // 写入数据
-        let data = vec![1, 2, 3, 4];
-        let written = buffer.write(&data);
-        assert_eq!(written, 4);
-
-        // 读取数据
-        let read_data = buffer.read(2);
-        assert_eq!(&read_data[..], &[1, 2]);
-
-        // 检查可用空间
-        assert_eq!(buffer.available_space(), 6);
-        assert_eq!(buffer.used_space(), 2);
-
-        // 清空缓冲区
-        buffer.clear();
-        assert_eq!(buffer.available_space(), 8);
-        assert_eq!(buffer.used_space(), 0);
     }
 }

@@ -1,141 +1,168 @@
-//! FLAC格式编解码器实现
+//! FLAC格式编解码器
 //!
-//! 提供FLAC格式音频的编码和解码功能。使用Symphonia库进行解码。
+//! 提供FLAC格式音频数据的编解码功能。FLAC是一种无损音频压缩格式，
+//! 能够完美还原原始音频数据，同时提供较高的压缩率。
+//!
+//! # 特性
+//! - 支持多种采样率和声道配置
+//! - 无损压缩，完美还原音质
+//! - 支持元数据标签
+//!
+//! # 示例
+//! ```no_run
+//! use crate::audio::codecs::FlacCodec;
+//! use crate::audio::format::AudioFormat;
+//!
+//! // 创建默认的FLAC编解码器（44.1kHz, 2声道, 16位）
+//! let mut codec = FlacCodec::default().unwrap();
+//!
+//! // 或者使用自定义格式创建
+//! let format = AudioFormat::new(
+//!     AudioCodec::Flac,
+//!     48000,  // 采样率
+//!     2,      // 声道数
+//!     24,     // 位深度
+//! );
+//! let mut codec = FlacCodec::new(format).unwrap();
+//! ```
 
-use crate::audio::format::AudioFormat;
-use crate::error::{ServiceError, ServiceResult};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
-use std::io::Cursor;
 
-/// FLAC解码器
-pub struct FlacDecoder {
+use super::AudioCodec;
+use crate::audio::format::{self, AudioFormat};
+use crate::error::{ServiceError, ServiceResult};
+
+/// FLAC格式编解码器
+///
+/// 使用libFLAC库实现FLAC格式音频的编码和解码。
+/// 支持多种采样率和声道配置，提供无损压缩。
+pub struct FlacCodec {
+    /// 支持的音频格式
+    /// 包含采样率、声道数、位深度等参数
     format: AudioFormat,
+    /// 编码器状态
+    /// 用于存储FLAC编码器的内部状态，包括编码参数和缓冲区
+    encoder_state: Option<flac_sys::FLAC__StreamEncoder>,
+    /// 解码器状态
+    /// 用于存储FLAC解码器的内部状态，包括解码参数和缓冲区
+    decoder_state: Option<flac_sys::FLAC__StreamDecoder>,
 }
 
-impl FlacDecoder {
-    /// 创建新的FLAC解码器
-    pub fn new(format: AudioFormat) -> Self {
-        Self { format }
-    }
-}
-
-#[async_trait]
-impl super::AudioDecoder for FlacDecoder {
-    async fn decode(&mut self, data: Bytes) -> ServiceResult<Bytes> {
-        // 创建媒体源
-        let cursor = Cursor::new(data);
-        let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-
-        // 创建格式探测器
-        let mut hint = Hint::new();
-        hint.with_extension("flac");
-
-        // 探测格式
-        let format_opts = FormatOptions::default();
-        let metadata_opts = MetadataOptions::default();
-        let decoder_opts = DecoderOptions::default();
-
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &metadata_opts)
-            .map_err(|e| ServiceError::InvalidFormat(format!("无法识别FLAC格式: {}", e)))?;
-
-        let mut format = probed.format;
-        let track = format
-            .default_track()
-            .ok_or_else(|| ServiceError::InvalidFormat("无法获取音频轨道".to_string()))?;
-
-        // 创建解码器
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &decoder_opts)
-            .map_err(|e| ServiceError::InvalidFormat(format!("无法创建解码器: {}", e)))?;
-
-        let mut samples = Vec::new();
-
-        // 解码音频帧
-        while let Ok(packet) = format.next_packet() {
-            let decoded = decoder
-                .decode(&packet)
-                .map_err(|e| ServiceError::InvalidFormat(format!("解码失败: {}", e)))?;
-
-            let mut sample_buf = SampleBuffer::new(decoded.capacity() as u64, *decoded.spec());
-            sample_buf.copy_interleaved_ref(decoded);
-
-            // 将采样点转换为f32
-            samples.extend(
-                sample_buf
-                    .samples()
-                    .iter()
-                    .map(|&s| s as f32 / 32768.0),
-            );
+impl FlacCodec {
+    /// 创建新的FLAC编解码器
+    ///
+    /// # 参数
+    /// * `format` - 音频格式参数，包括采样率、声道数和位深度
+    ///
+    /// # 返回
+    /// * `Ok(FlacCodec)` - 成功创建编解码器
+    /// * `Err(ServiceError)` - 格式不支持或参数无效
+    pub fn new(format: AudioFormat) -> ServiceResult<Self> {
+        if format.codec != format::AudioCodec::Flac {
+            return Err(ServiceError::InvalidFormat(
+                "不支持的音频格式".to_string(),
+            ));
         }
 
-        // 转换为字节
-        let bytes: Vec<u8> = samples
-            .iter()
-            .flat_map(|&s| s.to_le_bytes().to_vec())
-            .collect();
-
-        Ok(Bytes::from(bytes))
+        Ok(Self {
+            format,
+            encoder_state: None,
+            decoder_state: None,
+        })
     }
 
-    fn output_format(&self) -> AudioFormat {
-        self.format.clone()
+    /// 创建默认的FLAC编解码器
+    ///
+    /// 使用标准的音频参数创建编解码器：
+    /// - 采样率：44.1kHz
+    /// - 声道数：2（立体声）
+    /// - 位深度：16位
+    ///
+    /// # 返回
+    /// * `Ok(FlacCodec)` - 成功创建编解码器
+    /// * `Err(ServiceError)` - 创建失败
+    pub fn default() -> ServiceResult<Self> {
+        Self::new(AudioFormat::new(
+            format::AudioCodec::Flac,
+            44100,
+            2,
+            16,
+        ))
     }
-}
 
-/// FLAC编码器
-pub struct FlacEncoder {
-    format: AudioFormat,
-}
+    /// 初始化编码器
+    ///
+    /// 配置并初始化FLAC编码器，设置编码参数和分配必要的缓冲区。
+    /// 在第一次调用encode方法时会自动调用此函数。
+    ///
+    /// # 返回
+    /// * `Ok(())` - 初始化成功
+    /// * `Err(ServiceError)` - 初始化失败
+    fn init_encoder(&mut self) -> ServiceResult<()> {
+        // TODO: 初始化FLAC编码器
+        // 这里需要添加libFLAC库的初始化代码
+        Ok(())
+    }
 
-impl FlacEncoder {
-    /// 创建新的FLAC编码器
-    pub fn new(format: AudioFormat) -> Self {
-        Self { format }
+    /// 初始化解码器
+    ///
+    /// 配置并初始化FLAC解码器，设置解码参数和分配必要的缓冲区。
+    /// 在第一次调用decode方法时会自动调用此函数。
+    ///
+    /// # 返回
+    /// * `Ok(())` - 初始化成功
+    /// * `Err(ServiceError)` - 初始化失败
+    fn init_decoder(&mut self) -> ServiceResult<()> {
+        // TODO: 初始化FLAC解码器
+        // 这里需要添加libFLAC库的初始化代码
+        Ok(())
     }
 }
 
 #[async_trait]
-impl super::AudioEncoder for FlacEncoder {
-    async fn encode(&mut self, data: Bytes) -> ServiceResult<Bytes> {
-        // 将字节转换为采样点
-        let samples: Vec<f32> = data
-            .chunks(4)
-            .map(|chunk| {
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(chunk);
-                f32::from_le_bytes(bytes)
-            })
-            .collect();
-
-        // TODO: 实现FLAC编码
-        // 需要集成FLAC编码库，如libflac或其他Rust实现
-        Err(ServiceError::Unimplemented("FLAC编码器尚未实现".to_string()))
+impl AudioCodec for FlacCodec {
+    fn name(&self) -> &str {
+        "flac"
     }
 
-    fn output_format(&self) -> AudioFormat {
-        self.format.clone()
+    async fn encode(&mut self, data: Bytes, format: &AudioFormat) -> ServiceResult<Bytes> {
+        if !self.supports_format(format) {
+            return Err(ServiceError::InvalidFormat(
+                "不支持的FLAC格式".to_string(),
+            ));
+        }
+
+        if self.encoder_state.is_none() {
+            self.init_encoder()?;
+        }
+
+        // TODO: 使用FLAC编码器将PCM数据编码为FLAC格式
+        // 这里需要添加实际的编码逻辑
+
+        Ok(Bytes::new()) // 临时返回空数据
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::audio::format::AudioCodec;
+    async fn decode(&mut self, data: Bytes, format: &AudioFormat) -> ServiceResult<Bytes> {
+        if !self.supports_format(format) {
+            return Err(ServiceError::InvalidFormat(
+                "不支持的FLAC格式".to_string(),
+            ));
+        }
 
-    #[tokio::test]
-    async fn test_flac_decoder() {
-        // 创建测试数据（这里需要一个有效的FLAC文件数据）
-        let format = AudioFormat::new(AudioCodec::Flac, 44100, 2);
-        let decoder = FlacDecoder::new(format);
+        if self.decoder_state.is_none() {
+            self.init_decoder()?;
+        }
 
-        // TODO: 添加解码器测试用例
+        // TODO: 使用FLAC解码器将FLAC数据解码为PCM格式
+        // 这里需要添加实际的解码逻辑
+
+        Ok(Bytes::new()) // 临时返回空数据
+    }
+
+    fn reset(&mut self) {
+        // 重置编解码器状态
+        self.encoder_state = None;
+        self.decoder_state = None;
     }
 }

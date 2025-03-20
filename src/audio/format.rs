@@ -49,6 +49,34 @@ impl From<&str> for AudioCodec {
     }
 }
 
+/// 音频处理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioProcessConfig {
+    /// 音量增益（默认为1.0）
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    /// 是否启用通道合并（多通道合并为单通道）
+    #[serde(default)]
+    pub merge_channels: bool,
+    /// 是否启用音量归一化
+    #[serde(default)]
+    pub normalize_volume: bool,
+}
+
+fn default_volume() -> f32 {
+    1.0
+}
+
+impl Default for AudioProcessConfig {
+    fn default() -> Self {
+        Self {
+            volume: default_volume(),
+            merge_channels: false,
+            normalize_volume: false,
+        }
+    }
+}
+
 /// 音频格式参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFormat {
@@ -61,6 +89,11 @@ pub struct AudioFormat {
     /// 比特率（bps）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bit_rate: Option<u32>,
+    /// 采样位数
+    pub bits_per_sample: u16,
+    /// 音频处理配置
+    #[serde(default)]
+    pub process_config: AudioProcessConfig,
 }
 
 impl Default for AudioFormat {
@@ -70,82 +103,47 @@ impl Default for AudioFormat {
             sample_rate: 16000,
             channels: 1,
             bit_rate: None,
+            bits_per_sample: 16,
+            process_config: AudioProcessConfig::default(),
         }
     }
 }
 
 impl AudioFormat {
     /// 创建新的音频格式
-    pub fn new(codec: AudioCodec, sample_rate: u32, channels: u8) -> Self {
+    pub fn new(codec: AudioCodec, sample_rate: u32, channels: u8, bits_per_sample: u16) -> Self {
         Self {
             codec,
             sample_rate,
             channels,
             bit_rate: None,
+            bits_per_sample,
+            process_config: AudioProcessConfig::default(),
         }
     }
 
     /// 创建带比特率的音频格式
-    pub fn with_bit_rate(codec: AudioCodec, sample_rate: u32, channels: u8, bit_rate: u32) -> Self {
+    pub fn with_bit_rate(
+        codec: AudioCodec,
+        sample_rate: u32,
+        channels: u8,
+        bits_per_sample: u16,
+        bit_rate: u32,
+    ) -> Self {
         Self {
             codec,
             sample_rate,
             channels,
             bit_rate: Some(bit_rate),
+            bits_per_sample,
+            process_config: AudioProcessConfig::default(),
         }
     }
-}
 
-/// 音频转换参数
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AudioParams {
-    /// 目标编解码器
-    pub codec: Option<AudioCodec>,
-    /// 目标采样率
-    pub sample_rate: Option<u32>,
-    /// 目标通道数
-    pub channels: Option<u8>,
-    /// 目标比特率
-    pub bit_rate: Option<u32>,
-}
-
-impl AudioParams {
-    /// 创建新的转换参数
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 设置目标编解码器
-    pub fn with_codec(mut self, codec: AudioCodec) -> Self {
-        self.codec = Some(codec);
-        self
-    }
-
-    /// 设置目标采样率
-    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
-        self.sample_rate = Some(sample_rate);
-        self
-    }
-
-    /// 设置目标通道数
-    pub fn with_channels(mut self, channels: u8) -> Self {
-        self.channels = Some(channels);
-        self
-    }
-
-    /// 设置目标比特率
-    pub fn with_bit_rate(mut self, bit_rate: u32) -> Self {
-        self.bit_rate = Some(bit_rate);
-        self
-    }
-
-    /// 应用参数到音频格式
-    pub fn apply_to(&self, input: &AudioFormat) -> AudioFormat {
-        AudioFormat {
-            codec: self.codec.clone().unwrap_or(input.codec.clone()),
-            sample_rate: self.sample_rate.unwrap_or(input.sample_rate),
-            channels: self.channels.unwrap_or(input.channels),
-            bit_rate: self.bit_rate.or(input.bit_rate),
-        }
+    /// 检查格式是否兼容
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        self.sample_rate == other.sample_rate
+            && self.channels == other.channels
+            && self.bits_per_sample == other.bits_per_sample
     }
 }

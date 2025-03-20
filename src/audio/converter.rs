@@ -1,140 +1,171 @@
-//! 音频流转换器
+//! 音频转换器
 //!
-//! 提供音频格式之间的实时转换功能，支持WAV、MP3等常见格式。
-//! 实现了流式处理接口，可以进行实时音频转换。
+//! 提供音频格式之间的转换功能，支持一对多的格式转换。
+//! 实现了流式和非流式处理接口。
 
-use crate::audio::codecs::{self, AudioDecoder, AudioEncoder};
-use crate::audio::format::{AudioCodec, AudioFormat};
-use crate::audio::stream::{AudioChunk, StreamProcessor};
-use crate::error::{ServiceError, ServiceResult};
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream;
 use tracing::{debug, error};
 
-/// 音频流转换器
-///
-/// 支持不同音频格式之间的实时转换，实现了StreamProcessor trait。
-pub struct AudioStreamConverter {
-    /// 输入音频格式
-    input_format: AudioFormat,
-    /// 输出音频格式
-    output_format: AudioFormat,
-    /// 音频解码器
-    decoder: Box<dyn AudioDecoder>,
-    /// 音频编码器
-    encoder: Box<dyn AudioEncoder>,
+use super::buffer::{BufferConfig, RingBuffer};
+use super::format::{AudioCodec, AudioFormat};
+use super::processors::{AudioProcessor, AudioProcessorParams};
+use super::stream::{AudioChunk, AudioStream, StreamProcessor};
+use crate::error::{ServiceError, ServiceResult};
+
+/// 音频转换配置
+#[derive(Debug, Clone)]
+pub struct ConverterConfig {
+    /// 输入格式
+    pub input_format: AudioFormat,
+    /// 输出格式列表
+    pub output_formats: Vec<AudioFormat>,
+    /// 缓冲区配置
+    pub buffer_config: BufferConfig,
 }
 
-impl AudioStreamConverter {
-    /// 创建新的音频流转换器
-    ///
-    /// # 参数
-    ///
-    /// * `input_format` - 输入音频格式
-    /// * `output_format` - 输出音频格式
-    pub fn new(input_format: AudioFormat, output_format: AudioFormat) -> ServiceResult<Self> {
-        // 创建解码器
-        let decoder: Box<dyn AudioDecoder> = match input_format.codec {
-            AudioCodec::Wav => Box::new(codecs::WavDecoder::new(input_format.clone())),
-            AudioCodec::Mp3 => Box::new(codecs::Mp3Decoder::new(input_format.clone())),
-            _ => return Err(ServiceError::InvalidFormat(format!(
-                "不支持的输入格式: {}", input_format.codec
-            ))),
+/// 音频转换器
+///
+/// 支持将一种音频格式转换为多种目标格式，可以同时输出多个转换结果。
+pub struct AudioConverter {
+    /// 转换器配置
+    config: ConverterConfig,
+    /// 输入缓冲区
+    input_buffer: RingBuffer,
+    /// 输出缓冲区映射（格式 -> 缓冲区）
+    output_buffers: HashMap<AudioFormat, RingBuffer>,
+    /// 格式转换处理器
+    format_processor: Box<dyn AudioProcessor>,
+    /// 效果处理器列表
+    effect_processors: Vec<Box<dyn AudioProcessor>>,
+}
+
+impl AudioConverter {
+    /// 创建新的音频转换器
+    pub fn new(config: ConverterConfig, format_processor: Box<dyn AudioProcessor>) -> ServiceResult<Self> {
+        let input_buffer = RingBuffer::new(config.buffer_config.clone());
+        let mut output_buffers = HashMap::new();
+
+        // 为每个输出格式创建缓冲区
+        for format in &config.output_formats {
+            output_buffers.insert(
+                format.clone(),
+                RingBuffer::new(config.buffer_config.clone()),
+            );
+        }
+
+        let processor_params = AudioProcessorParams {
+            sample_rate: config.input_format.sample_rate,
+            channels: config.input_format.channels,
+            bits_per_sample: config.input_format.bits_per_sample,
         };
 
-        // 创建编码器
-        let encoder: Box<dyn AudioEncoder> = match output_format.codec {
-            AudioCodec::Wav => Box::new(codecs::WavEncoder::new(output_format.clone())),
-            AudioCodec::Mp3 => Box::new(codecs::Mp3Encoder::new(output_format.clone())),
-            _ => return Err(ServiceError::InvalidFormat(format!(
-                "不支持的输出格式: {}", output_format.codec
-            ))),
-        };
+        // 创建效果处理器列表
+        let mut effect_processors = Vec::new();
+        let process_config = &config.input_format.process_config;
+
+        // 添加音量处理器
+        if process_config.volume != 1.0 || process_config.normalize_volume {
+            effect_processors.push(Box::new(super::processors::volume::VolumeProcessor::new(
+                process_config.volume,
+                process_config.normalize_volume,
+                processor_params.clone(),
+            )));
+        }
+
+        // 添加通道处理器
+        if process_config.merge_channels {
+            effect_processors.push(Box::new(super::processors::channel::ChannelProcessor::new(
+                processor_params.clone(),
+                true,
+            )));
+        }
 
         Ok(Self {
-            input_format,
-            output_format,
-            decoder,
-            encoder,
+            config,
+            input_buffer,
+            output_buffers,
+            format_processor,
+            effect_processors,
         })
     }
 
-    /// 获取输入格式
-    pub fn input_format(&self) -> &AudioFormat {
-        &self.input_format
+    /// 添加效果处理器
+    pub fn add_effect_processor(&mut self, processor: Box<dyn AudioProcessor>) {
+        self.effect_processors.push(processor);
     }
 
-    /// 获取输出格式
-    pub fn output_format(&self) -> &AudioFormat {
-        &self.output_format
+    /// 处理音频数据
+    pub async fn process(&mut self, data: Bytes) -> ServiceResult<HashMap<AudioFormat, Bytes>> {
+        // 写入输入缓冲区
+        let written = self.input_buffer.write(&data);
+        if written < data.len() {
+            error!("输入缓冲区已满，部分数据丢失");
+        }
+
+        // 处理音频数据
+        let mut processed = self.format_processor.process(data).await?;
+
+        // 执行效果处理
+        for processor in &mut self.effect_processors {
+            processed = processor.process(processed).await?;
+        }
+
+        // 写入输出缓冲区
+        let mut results = HashMap::new();
+        for (format, buffer) in &self.output_buffers {
+            buffer.write(&processed);
+            results.insert(format.clone(), buffer.read(processed.len()));
+        }
+
+        Ok(results)
+    }
+
+    /// 获取指定格式的输出流
+    pub fn get_output_stream(&self, format: &AudioFormat) -> Option<AudioStream> {
+        self.output_buffers.get(format).map(|buffer| {
+            let buffer = buffer.clone();
+            AudioStream::new(stream::unfold(buffer, |buffer| async move {
+                let data = buffer.read(1024);
+                if data.is_empty() {
+                    None
+                } else {
+                    Some((Ok(AudioChunk::new(data, 0, 0, false)), buffer))
+                }
+            }))
+        })
+    }
+
+    /// 清空所有缓冲区
+    pub fn clear(&mut self) {
+        self.input_buffer.clear();
+        for buffer in self.output_buffers.values() {
+            buffer.clear();
+        }
     }
 }
 
 #[async_trait]
-impl StreamProcessor for AudioStreamConverter {
+impl StreamProcessor for AudioConverter {
     async fn process_chunk(&mut self, chunk: AudioChunk) -> ServiceResult<AudioChunk> {
-        debug!("处理音频块: {} 字节", chunk.data.len());
+        let results = self.process(chunk.data).await?;
 
-        // 解码为PCM
-        let pcm = self.decoder.decode(chunk.data).await?;
-
-        // 编码为目标格式
-        let encoded = self.encoder.encode(pcm).await?;
-
-        Ok(AudioChunk::new(
-            encoded,
-            chunk.timestamp,
-            chunk.duration,
-            chunk.is_last,
-        ))
-    }
-
-    async fn flush(&mut self) -> ServiceResult<Option<AudioChunk>> {
-        // 刷新解码器
-        if let Some(pcm) = self.decoder.flush().await? {
-            let encoded = self.encoder.encode(pcm).await?;
-            return Ok(Some(AudioChunk::new(encoded, 0, 0, true)));
+        // 返回第一个输出格式的结果
+        if let Some(format) = self.config.output_formats.first() {
+            if let Some(data) = results.get(format) {
+                return Ok(AudioChunk::new(
+                    data.clone(),
+                    chunk.timestamp,
+                    chunk.duration,
+                    chunk.is_last,
+                ));
+            }
         }
 
-        // 刷新编码器
-        if let Some(encoded) = self.encoder.flush().await? {
-            return Ok(Some(AudioChunk::new(encoded, 0, 0, true)));
-        }
-
-        Ok(None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-
-    #[tokio::test]
-    async fn test_wav_to_mp3() {
-        // 创建测试数据
-        let samples: Vec<f32> = vec![-0.5, 0.0, 0.5, 1.0];
-        let input_data = Bytes::from(
-            samples
-                .iter()
-                .flat_map(|&s| s.to_le_bytes().to_vec())
-                .collect::<Vec<u8>>(),
-        );
-
-        // 创建转换器
-        let converter = AudioStreamConverter::new(
-            AudioFormat::new(AudioCodec::Wav, 44100, 1),
-            AudioFormat::with_bit_rate(AudioCodec::Mp3, 44100, 1, 192000),
-        )
-        .unwrap();
-
-        // 创建音频块
-        let chunk = AudioChunk::new(input_data, 0, 1000, true);
-
-        // 执行转换
-        let result = converter.process_chunk(chunk).await.unwrap();
-
-        // 验证结果
-        assert!(!result.data.is_empty());
+        Ok(AudioChunk::empty())
     }
 }

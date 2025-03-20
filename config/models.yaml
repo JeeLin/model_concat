@@ -1,0 +1,100 @@
+# 模型服务提供商配置示例
+providers:
+  # OpenAI提供商配置
+  openai:
+    name: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key: "your-openai-api-key"
+    timeout_sec: 30
+    max_retries: 3
+    internal_network: false
+    cert_path: null
+    protocol_type: "http"
+    models:
+      # GPT-4模型配置
+      gpt-4:
+        id: "gpt-4"
+        name: "GPT-4"
+        version: "1.0"
+        protocol: "http"
+        default_params:
+          temperature: 0.7
+          max_tokens: 2048
+          top_p: 1.0
+        supported_formats:
+          input_formats:
+            - data_type: "Text"
+              streaming: true
+              audio_format: null
+          output_formats:
+            - data_type: "Text"
+              streaming: true
+              audio_format: null
+        max_input_length: 8192
+        max_output_length: 4096
+      
+      # Whisper模型配置
+      whisper:
+        id: "whisper"
+        name: "Whisper"
+        version: "1.0"
+        protocol: "http"
+        default_params:
+          temperature: 0.0
+          max_tokens: 4096
+          top_p: 1.0
+        supported_formats:
+          input_formats:
+            - data_type: "Audio"
+              streaming: false
+              audio_format:
+                codec: "mp3"
+                sample_rate: 16000
+                channels: 1
+                bits_per_sample: 16
+                bit_rate: 128000
+            - data_type: "Audio"
+              streaming: false
+              audio_format:
+                codec: "wav"
+                sample_rate: 16000
+                channels: 1
+                bits_per_sample: 16
+                bit_rate: null
+          output_formats:
+            - data_type: "Text"
+              streaming: false
+              audio_format: null
+
+  # DeepSeek提供商配置
+  deepseek:
+    name: "deepseek"
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "your-deepseek-api-key"
+    timeout_sec: 30
+    max_retries: 3
+    internal_network: false
+    cert_path: null
+    protocol_type: "http"
+    models:
+      # DeepSeek-Chat模型配置
+      deepseek-chat:
+        id: "deepseek-chat"
+        name: "DeepSeek Chat"
+        version: "1.0"
+        protocol: "http"
+        default_params:
+          temperature: 0.7
+          max_tokens: 2048
+          top_p: 1.0
+        supported_formats:
+          input_formats:
+            - data_type: "Text"
+              streaming: true
+              audio_format: null
+          output_formats:
+            - data_type: "Text"
+              streaming: true
+              audio_format: null
+        max_input_length: 8192
+        max_output_length: 4096

@@ -1,7 +1,7 @@
-//! OpenAI提供商适配器
+//! DeepSeek提供商适配器
 //!
-//! 本模块实现了OpenAI API的适配器，支持GPT系列模型的调用。
-//! 实现了Provider trait，提供了与OpenAI API交互的标准方法。
+//! 本模块实现了DeepSeek API的适配器，支持DeepSeek系列模型的调用。
+//! 实现了Provider trait，提供了与DeepSeek API交互的标准方法。
 
 use crate::model::config::{ModelConfig, ProviderConfig, ProtocolType};
 use crate::model::error::{ModelError, ModelResult};
@@ -16,17 +16,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// OpenAI提供商
+/// DeepSeek提供商
 #[derive(Debug)]
-pub struct OpenAIProvider {
+pub struct DeepSeekProvider {
     /// 提供商配置
     config: ProviderConfig,
     /// HTTP客户端
     http_client: Client,
 }
 
-impl OpenAIProvider {
-    /// 创建新的OpenAI提供商
+impl DeepSeekProvider {
+    /// 创建新的DeepSeek提供商
     pub fn new(config: ProviderConfig) -> Self {
         // 创建HTTP客户端
         let mut headers = header::HeaderMap::new();
@@ -50,7 +50,7 @@ impl OpenAIProvider {
 
     /// 创建HTTP协议处理器
     async fn create_http_handler(&self) -> Box<dyn ProtocolHandler> {
-        Box::new(OpenAIHttpHandler {
+        Box::new(DeepSeekHttpHandler {
             client: self.http_client.clone(),
             base_url: self.config.base_url.clone(),
         })
@@ -59,13 +59,13 @@ impl OpenAIProvider {
     /// 创建WebSocket协议处理器
     async fn create_ws_handler(&self) -> ModelResult<Box<dyn ProtocolHandler>> {
         Err(ModelError::UnsupportedOperation(
-            "OpenAI WebSocket协议尚未实现".to_string(),
+            "DeepSeek WebSocket协议尚未实现".to_string(),
         ))
     }
 }
 
 #[async_trait]
-impl Provider for OpenAIProvider {
+impl Provider for DeepSeekProvider {
     async fn select_protocol(
         &self,
         protocol_type: &str,
@@ -78,7 +78,7 @@ impl Provider for OpenAIProvider {
     }
 
     fn name(&self) -> &str {
-        "openai"
+        "deepseek"
     }
 
     async fn create_model(
@@ -94,7 +94,7 @@ impl Provider for OpenAIProvider {
             .ok_or_else(|| ModelError::ModelNotFound(model_id.to_string()))?;
 
         // 创建模型实例
-        let model = OpenAIModel {
+        let model = DeepSeekModel {
             id: model_id.to_string(),
             provider: self.name().to_string(),
             config: model_config.clone(),
@@ -110,14 +110,14 @@ impl Provider for OpenAIProvider {
         // 简单验证API密钥是否存在
         if self.config.api_key.is_empty() {
             return Err(ModelError::AuthenticationError(
-                "OpenAI API密钥不能为空".to_string(),
+                "DeepSeek API密钥不能为空".to_string(),
             ));
         }
 
         // 验证基础URL是否有效
         if self.config.base_url.is_empty() {
             return Err(ModelError::ParameterError(
-                "OpenAI基础URL不能为空".to_string(),
+                "DeepSeek基础URL不能为空".to_string(),
             ));
         }
 
@@ -129,9 +129,9 @@ impl Provider for OpenAIProvider {
     }
 }
 
-/// OpenAI HTTP协议处理器
+/// DeepSeek HTTP协议处理器
 #[derive(Debug, Clone)]
-struct OpenAIHttpHandler {
+struct DeepSeekHttpHandler {
     /// HTTP客户端
     client: Client,
     /// 基础URL
@@ -139,12 +139,12 @@ struct OpenAIHttpHandler {
 }
 
 #[async_trait]
-impl ProtocolHandler for OpenAIHttpHandler {
+impl ProtocolHandler for DeepSeekHttpHandler {
     async fn send_request(&self, payload: &[u8]) -> ModelResult<Vec<u8>> {
         // 发送HTTP请求
         let response = self
             .client
-            .post(&format!("{}/chat/completions", self.base_url))
+            .post(&self.base_url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(payload.to_vec())
             .send()
@@ -178,56 +178,19 @@ impl ProtocolHandler for OpenAIHttpHandler {
         payload: &[u8],
         _stream_type: StreamRequestType,
     ) -> ModelResult<StreamResponseType> {
-        // 发送流式HTTP请求
-        let response = self
-            .client
-            .post(&format!("{}/chat/completions", self.base_url))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(payload.to_vec())
-            .send()
-            .await
-            .map_err(|e| ModelError::ConnectionError(e.to_string()))?;
-
-        // 检查响应状态
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "无法获取错误详情".to_string());
-            return Err(ModelError::ApiCallError(format!(
-                "HTTP流式请求失败: {} - {}",
-                status, error_text
-            )));
-        }
-
-        // 创建流式响应
-        let stream = response.bytes_stream().map(move |result| {
-            result
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| ModelError::ConnectionError(e.to_string()))
-        });
-
-        Ok(Box::pin(stream))
+        Err(ModelError::UnsupportedOperation(
+            "DeepSeek HTTP流式请求尚未实现".to_string(),
+        ))
     }
 }
 
-/// OpenAI聊天消息
+/// DeepSeek模型请求
 #[derive(Debug, Serialize, Deserialize)]
-struct ChatMessage {
-    /// 角色
-    role: String,
-    /// 内容
-    content: String,
-}
-
-/// OpenAI聊天请求
-#[derive(Debug, Serialize, Deserialize)]
-struct ChatRequest {
+struct DeepSeekRequest {
     /// 模型ID
     model: String,
-    /// 消息列表
-    messages: Vec<ChatMessage>,
+    /// 提示信息
+    prompt: String,
     /// 温度参数
     temperature: f32,
     /// 最大生成token数
@@ -238,37 +201,20 @@ struct ChatRequest {
     stream: bool,
 }
 
-/// OpenAI聊天响应
+/// DeepSeek模型响应
 #[derive(Debug, Serialize, Deserialize)]
-struct ChatResponse {
+struct DeepSeekResponse {
     /// 响应ID
     id: String,
-    /// 对象类型
-    object: String,
-    /// 创建时间
-    created: u64,
-    /// 模型ID
-    model: String,
-    /// 选择列表
-    choices: Vec<ChatChoice>,
-    /// 使用统计
-    usage: ChatUsage,
+    /// 生成的文本
+    text: String,
+    /// 使用的token数
+    usage: DeepSeekUsage,
 }
 
-/// OpenAI聊天选择
+/// DeepSeek使用统计
 #[derive(Debug, Serialize, Deserialize)]
-struct ChatChoice {
-    /// 索引
-    index: u32,
-    /// 消息
-    message: ChatMessage,
-    /// 结束原因
-    finish_reason: Option<String>,
-}
-
-/// OpenAI使用统计
-#[derive(Debug, Serialize, Deserialize)]
-struct ChatUsage {
+struct DeepSeekUsage {
     /// 提示token数
     prompt_tokens: u32,
     /// 生成token数
@@ -277,9 +223,9 @@ struct ChatUsage {
     total_tokens: u32,
 }
 
-/// OpenAI模型
+/// DeepSeek模型
 #[derive(Debug)]
-struct OpenAIModel {
+struct DeepSeekModel {
     /// 模型ID
     id: String,
     /// 提供商名称
@@ -295,20 +241,14 @@ struct OpenAIModel {
 }
 
 #[async_trait]
-impl Model for OpenAIModel {
+impl Model for DeepSeekModel {
     async fn process(&self, input: DataType) -> ModelResult<DataType> {
         match input {
             DataType::Text { content, mode } => {
-                // 创建聊天消息
-                let message = ChatMessage {
-                    role: "user".to_string(),
-                    content,
-                };
-
                 // 创建请求
-                let request = ChatRequest {
+                let request = DeepSeekRequest {
                     model: self.id.clone(),
-                    messages: vec![message],
+                    prompt: content,
                     temperature: self.parameters.temperature,
                     max_tokens: self.parameters.max_tokens,
                     top_p: self.parameters.top_p,
@@ -334,51 +274,25 @@ impl Model for OpenAIModel {
                 let response_data = handler.send_request(&payload).await?;
 
                 // 解析响应
-                let response: ChatResponse = serde_json::from_slice(&response_data)
+                let response: DeepSeekResponse = serde_json::from_slice(&response_data)
                     .map_err(|e| ModelError::ResponseParseError(e.to_string()))?;
-
-                // 提取生成的文本
-                let content = response
-                    .choices
-                    .first()
-                    .map(|choice| choice.message.content.clone())
-                    .unwrap_or_default();
 
                 // 返回结果
                 Ok(DataType::Text {
-                    content,
+                    content: response.text,
                     mode: StreamMode::NonStreaming,
                 })
             }
-            DataType::Audio { format, data, mode } => {
-                // 检查是否为Whisper模型
-                if self.id == "whisper" {
-                    // 这里应该实现音频转文本的处理
-                    // 简化实现，实际应该调用OpenAI的音频API
-                    Err(ModelError::UnsupportedOperation(
-                        "音频处理尚未实现".to_string(),
-                    ))
-                } else {
-                    Err(ModelError::UnsupportedFormat(
-                        "当前模型不支持音频输入".to_string(),
-                    ))
-                }
-            }
+            DataType::Audio { .. } => Err(ModelError::UnsupportedFormat(
+                "DeepSeek模型不支持音频输入".to_string(),
+            )),
         }
     }
 
     async fn process_stream(&self, input: StreamDataType) -> ModelResult<StreamDataType> {
-        match input {
-            StreamDataType::Text(stream) => {
-                // 暂时简化实现，实际应该处理流式请求
-                Err(ModelError::UnsupportedOperation(
-                    "OpenAI流式处理尚未完全实现".to_string(),
-                ))
-            }
-            StreamDataType::Audio(_) => Err(ModelError::UnsupportedFormat(
-                "OpenAI模型不支持音频流输入".to_string(),
-            )),
-        }
+        Err(ModelError::UnsupportedOperation(
+            "DeepSeek模型暂不支持流式处理".to_string(),
+        ))
     }
 
     fn metadata(&self) -> ModelMetadata {
@@ -387,57 +301,24 @@ impl Model for OpenAIModel {
             name: self.config.name.clone(),
             version: self.config.version.clone(),
             provider: self.provider.clone(),
-            description: format!("OpenAI {} 模型", self.id),
+            description: format!("DeepSeek {} 模型", self.id),
             input_formats: self.supported_input_formats(),
             output_formats: self.supported_output_formats(),
         }
     }
 
     fn supported_input_formats(&self) -> Vec<SupportedFormat> {
-        // 根据模型ID返回不同的支持格式
-        if self.id == "whisper" {
-            // Whisper支持音频输入
-            vec![
-                SupportedFormat {
-                    data_type: "Audio".to_string(),
-                    streaming: false,
-                    audio_format: Some(crate::audio::format::AudioFormat {
-                        codec: crate::audio::format::AudioCodec::Mp3,
-                        sample_rate: 16000,
-                        channels: 1,
-                        bits_per_sample: 16,
-                        bit_rate: Some(128000),
-                        process_config: Default::default(),
-                    }),
-                },
-                SupportedFormat {
-                    data_type: "Audio".to_string(),
-                    streaming: false,
-                    audio_format: Some(crate::audio::format::AudioFormat {
-                        codec: crate::audio::format::AudioCodec::Wav,
-                        sample_rate: 16000,
-                        channels: 1,
-                        bits_per_sample: 16,
-                        bit_rate: None,
-                        process_config: Default::default(),
-                    }),
-                },
-            ]
-        } else {
-            // GPT系列模型支持文本输入
-            vec![SupportedFormat {
-                data_type: "Text".to_string(),
-                streaming: true,
-                audio_format: None,
-            }]
-        }
+        vec![SupportedFormat {
+            data_type: "Text".to_string(),
+            streaming: false,
+            audio_format: None,
+        }]
     }
 
     fn supported_output_formats(&self) -> Vec<SupportedFormat> {
-        // 所有模型都支持文本输出
         vec![SupportedFormat {
             data_type: "Text".to_string(),
-            streaming: true,
+            streaming: false,
             audio_format: None,
         }]
     }
